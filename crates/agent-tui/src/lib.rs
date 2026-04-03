@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use agent_model::Usage;
-use crossterm::cursor::{MoveTo, Show};
+use crossterm::cursor::{MoveTo, MoveToColumn, MoveUp, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
@@ -33,6 +33,10 @@ pub struct TuiApp {
     terminal: Terminal,
     state: TuiState,
     last_frame: Vec<StyledLine>,
+    printed_committed_blocks: usize,
+    last_bottom_height: usize,
+    last_cursor_row_in_bottom: usize,
+    was_overlay_active: bool,
 }
 
 impl TuiApp {
@@ -41,12 +45,20 @@ impl TuiApp {
             terminal: Terminal::new(),
             state: TuiState::default(),
             last_frame: Vec::new(),
+            printed_committed_blocks: 0,
+            last_bottom_height: 0,
+            last_cursor_row_in_bottom: 0,
+            was_overlay_active: false,
         })
     }
 
     pub fn enter(&mut self) -> anyhow::Result<()> {
         self.terminal.enter()?;
         self.last_frame.clear();
+        self.printed_committed_blocks = 0;
+        self.last_bottom_height = 0;
+        self.last_cursor_row_in_bottom = 0;
+        self.was_overlay_active = false;
         self.render()
     }
 
@@ -72,6 +84,9 @@ impl TuiApp {
 
     pub fn replace_messages(&mut self, messages: &[AgentMessage]) {
         self.state.replace_messages(messages);
+        self.printed_committed_blocks = 0;
+        self.last_bottom_height = 0;
+        self.last_cursor_row_in_bottom = 0;
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -386,6 +401,38 @@ impl TuiApp {
     }
 
     fn render(&mut self) -> anyhow::Result<()> {
+        if !self.state.selection_items.is_empty() {
+            self.was_overlay_active = true;
+            self.last_frame.clear();
+            return self.render_full_frame();
+        }
+
+        if self.was_overlay_active {
+            self.was_overlay_active = false;
+            self.printed_committed_blocks = 0;
+            self.last_bottom_height = 0;
+            self.last_cursor_row_in_bottom = 0;
+            queue!(self.terminal.stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+            self.terminal.stdout.flush()?;
+        }
+
+        self.render_terminal_native()
+    }
+
+    fn render_terminal_native(&mut self) -> anyhow::Result<()> {
+        let (width, height) = terminal::size().context("failed to get terminal size")?;
+        self.state.viewport_width = width;
+        self.state.viewport_height = height;
+
+        self.clear_previous_bottom_block()?;
+        self.append_new_committed_blocks(width as usize)?;
+        let bottom = self.build_terminal_native_bottom(width as usize);
+        self.draw_terminal_native_bottom(&bottom)?;
+        self.terminal.stdout.flush()?;
+        Ok(())
+    }
+
+    fn render_full_frame(&mut self) -> anyhow::Result<()> {
         let (width, height) = terminal::size().context("failed to get terminal size")?;
         self.state.viewport_width = width;
         self.state.viewport_height = height;
@@ -483,6 +530,131 @@ impl TuiApp {
         );
         self.draw_frame(&frame, cursor_row, cursor_col)?;
         self.terminal.stdout.flush()?;
+        Ok(())
+    }
+
+    fn clear_previous_bottom_block(&mut self) -> anyhow::Result<()> {
+        if self.last_bottom_height == 0 {
+            return Ok(());
+        }
+
+        if self.last_cursor_row_in_bottom > 0 {
+            queue!(
+                self.terminal.stdout,
+                MoveToColumn(0),
+                MoveUp(self.last_cursor_row_in_bottom as u16)
+            )?;
+        } else {
+            queue!(self.terminal.stdout, MoveToColumn(0))?;
+        }
+        queue!(self.terminal.stdout, Clear(ClearType::FromCursorDown))?;
+        Ok(())
+    }
+
+    fn append_new_committed_blocks(&mut self, width: usize) -> anyhow::Result<()> {
+        if self.printed_committed_blocks >= self.state.committed_blocks.len() {
+            return Ok(());
+        }
+
+        let lines = self
+            .state
+            .render_committed_lines_from(width, self.printed_committed_blocks);
+        for line in lines {
+            apply_style(&mut self.terminal.stdout, line.kind)?;
+            queue!(
+                self.terminal.stdout,
+                Print(clip_to_width(&line.text, width)),
+                ResetColor,
+                Clear(ClearType::UntilNewLine),
+                Print("\r\n")
+            )?;
+        }
+
+        self.printed_committed_blocks = self.state.committed_blocks.len();
+        Ok(())
+    }
+
+    fn build_terminal_native_bottom(&self, width: usize) -> BottomFrame {
+        let mut lines = Vec::new();
+        let live_lines = self.state.render_live_lines(width);
+        if !live_lines.is_empty() {
+            lines.extend(
+                live_lines
+                    .into_iter()
+                    .map(|line| line.with_text(clip_to_width(&line.text, width))),
+            );
+            lines.push(StyledLine::blank());
+        }
+
+        let status_text = self.state.status_line();
+        if !status_text.is_empty() {
+            lines.push(StyledLine::new(
+                clip_to_width(&status_text, width),
+                LineKind::Status,
+            ));
+            lines.push(StyledLine::blank());
+        }
+
+        lines.push(StyledLine::new("─".repeat(width), LineKind::Divider));
+        let input_row_offset = lines.len();
+        let input_lines = render_input_lines(&self.state.input, width);
+        for (offset, line) in input_lines.iter().enumerate() {
+            let prefix = if offset == 0 {
+                INPUT_PREFIX
+            } else {
+                INPUT_CONTINUATION_PREFIX
+            };
+            lines.push(StyledLine::new(
+                clip_to_width(&format!("{prefix}{line}"), width),
+                LineKind::Input,
+            ));
+        }
+        lines.push(StyledLine::new("─".repeat(width), LineKind::Divider));
+        lines.push(StyledLine::new(
+            clip_to_width(&self.state.hint_line(), width),
+            LineKind::Hint,
+        ));
+
+        let (cursor_row, cursor_col) = cursor_position_for_input(
+            &self.state.input,
+            self.state.cursor,
+            width,
+            input_row_offset as u16,
+        );
+
+        BottomFrame {
+            lines,
+            cursor_row: cursor_row as usize,
+            cursor_col,
+        }
+    }
+
+    fn draw_terminal_native_bottom(&mut self, bottom: &BottomFrame) -> anyhow::Result<()> {
+        for (index, line) in bottom.lines.iter().enumerate() {
+            if index > 0 {
+                queue!(self.terminal.stdout, Print("\r\n"))?;
+            }
+            apply_style(&mut self.terminal.stdout, line.kind)?;
+            queue!(
+                self.terminal.stdout,
+                Print(&line.text),
+                ResetColor,
+                Clear(ClearType::UntilNewLine)
+            )?;
+        }
+
+        let rows_up = bottom
+            .lines
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(bottom.cursor_row);
+        if rows_up > 0 {
+            queue!(self.terminal.stdout, MoveUp(rows_up as u16))?;
+        }
+        queue!(self.terminal.stdout, MoveToColumn(bottom.cursor_col as u16), Show)?;
+
+        self.last_bottom_height = bottom.lines.len();
+        self.last_cursor_row_in_bottom = bottom.cursor_row;
         Ok(())
     }
 
@@ -599,6 +771,12 @@ pub enum RunningAction {
     Quit,
     Continue,
     QueueSubmit(String),
+}
+
+struct BottomFrame {
+    lines: Vec<StyledLine>,
+    cursor_row: usize,
+    cursor_col: usize,
 }
 
 #[cfg(test)]
@@ -953,6 +1131,22 @@ impl TuiState {
     fn render_committed_lines(&self, width: usize) -> Vec<StyledLine> {
         let mut raw_lines = Vec::new();
         for (index, block) in self.committed_blocks.iter().enumerate() {
+            if index > 0 && block.kind != BlockKind::System {
+                raw_lines.push(StyledLine::blank());
+            }
+            raw_lines.extend(block.lines.iter().cloned());
+        }
+        wrap_lines(&raw_lines, width)
+    }
+
+    fn render_committed_lines_from(&self, width: usize, start_block: usize) -> Vec<StyledLine> {
+        let mut raw_lines = Vec::new();
+        for (index, block) in self
+            .committed_blocks
+            .iter()
+            .enumerate()
+            .skip(start_block)
+        {
             if index > 0 && block.kind != BlockKind::System {
                 raw_lines.push(StyledLine::blank());
             }
