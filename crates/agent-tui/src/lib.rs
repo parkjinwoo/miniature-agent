@@ -578,24 +578,18 @@ impl TuiApp {
         let mut lines = Vec::new();
         let live_lines = self.state.render_live_lines(width);
         if !live_lines.is_empty() {
+            let tail_start = live_lines.len().saturating_sub(2);
             lines.extend(
-                live_lines
-                    .into_iter()
+                live_lines[tail_start..]
+                    .iter()
                     .map(|line| line.with_text(clip_to_width(&line.text, width))),
             );
+        }
+
+        if !lines.is_empty() {
             lines.push(StyledLine::blank());
         }
 
-        let status_text = self.state.status_line();
-        if !status_text.is_empty() {
-            lines.push(StyledLine::new(
-                clip_to_width(&status_text, width),
-                LineKind::Status,
-            ));
-            lines.push(StyledLine::blank());
-        }
-
-        lines.push(StyledLine::new("─".repeat(width), LineKind::Divider));
         let input_row_offset = lines.len();
         let input_lines = render_input_lines(&self.state.input, width);
         for (offset, line) in input_lines.iter().enumerate() {
@@ -609,11 +603,13 @@ impl TuiApp {
                 LineKind::Input,
             ));
         }
-        lines.push(StyledLine::new("─".repeat(width), LineKind::Divider));
-        lines.push(StyledLine::new(
-            clip_to_width(&self.state.hint_line(), width),
-            LineKind::Hint,
-        ));
+        let info_line = self.state.terminal_native_info_line();
+        if !info_line.is_empty() {
+            lines.push(StyledLine::new(
+                clip_to_width(&info_line, width),
+                LineKind::Hint,
+            ));
+        }
 
         let (cursor_row, cursor_col) = cursor_position_for_input(
             &self.state.input,
@@ -1292,6 +1288,17 @@ impl TuiState {
             parts.push(footer_info);
         }
         parts.join(" · ")
+    }
+
+    fn terminal_native_info_line(&self) -> String {
+        let status = self.status_line();
+        let footer = self.footer_info_line();
+        match (status.is_empty(), footer.is_empty()) {
+            (false, false) => format!("{status} · {footer}"),
+            (false, true) => status,
+            (true, false) => footer,
+            (true, true) => String::new(),
+        }
     }
 
     fn footer_info_line(&self) -> String {
