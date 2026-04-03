@@ -576,12 +576,14 @@ impl TuiApp {
 
     fn build_terminal_native_bottom(&self, width: usize) -> BottomFrame {
         let mut lines = Vec::new();
-        let live_lines = self.state.render_live_lines(width);
-        if !live_lines.is_empty() {
-            let tail_start = live_lines.len().saturating_sub(2);
+        let live_monitor_lines = self.state.render_live_monitor_lines(
+            width,
+            self.state.terminal_native_live_monitor_height(),
+        );
+        if !live_monitor_lines.is_empty() {
             lines.extend(
-                live_lines[tail_start..]
-                    .iter()
+                live_monitor_lines
+                    .into_iter()
                     .map(|line| line.with_text(clip_to_width(&line.text, width))),
             );
         }
@@ -1170,6 +1172,61 @@ impl TuiState {
         wrap_lines(&raw_lines, width)
     }
 
+    fn terminal_native_live_monitor_height(&self) -> usize {
+        let height = self.viewport_height.max(24) as usize;
+        let target = (height / 5).clamp(5, 7);
+        target.min(20)
+    }
+
+    fn render_live_monitor_lines(&self, width: usize, max_lines: usize) -> Vec<StyledLine> {
+        if self.live_assistant.is_none() && self.live_tool.is_none() && !self.status.starts_with("Running")
+        {
+            return Vec::new();
+        }
+
+        let width = width.max(1);
+        let mut lines = Vec::new();
+
+        let title = self.live_monitor_title();
+        if !title.is_empty() {
+            lines.extend(
+                wrap_line_by_display_width(&title, width)
+                    .into_iter()
+                    .map(|segment| StyledLine::new(segment, LineKind::Status)),
+            );
+        }
+
+        if let Some(block) = &self.live_tool {
+            let mut tool_lines = wrap_lines(&block.lines, width);
+            if !tool_lines.is_empty() {
+                lines.push(StyledLine::blank());
+            }
+            let keep = tool_lines.len().saturating_sub(3);
+            lines.extend(tool_lines.drain(keep..));
+        }
+
+        if let Some(block) = &self.live_assistant {
+            let mut assistant_lines = wrap_lines(&block.lines, width);
+            assistant_lines.retain(|line| !line.text.trim().is_empty());
+            if !assistant_lines.is_empty() {
+                lines.push(StyledLine::blank());
+                let preview_title = StyledLine::new("Reply preview", LineKind::Hint);
+                lines.push(preview_title);
+                let keep = assistant_lines.len().saturating_sub(3);
+                lines.extend(
+                    assistant_lines
+                        .drain(keep..)
+                        .map(|line| StyledLine::new(line.text, LineKind::Plain)),
+                );
+            }
+        }
+
+        if lines.len() > max_lines {
+            lines = lines.split_off(lines.len() - max_lines);
+        }
+        lines
+    }
+
     fn visible_log_lines(&self) -> &[StyledLine] {
         let lines = self.active_log_lines();
         if self.rendered_log_height == 0 {
@@ -1252,7 +1309,7 @@ impl TuiState {
         let mut parts = Vec::new();
         if !self.status.is_empty() && self.status != "Ready" {
             if self.status.starts_with("Running") {
-                parts.push(self.status.clone());
+                parts.push("Working".to_string());
                 if let Some(status_since) = self.status_since {
                     parts.push(format_elapsed(status_since.elapsed()));
                 }
@@ -1316,6 +1373,20 @@ impl TuiState {
             parts.push("usage n/a".to_string());
         }
         parts.push(current_time_label());
+        parts.join(" · ")
+    }
+
+    fn live_monitor_title(&self) -> String {
+        let mut parts = Vec::new();
+        if self.live_tool.is_some() {
+            parts.push("Using tools".to_string());
+        } else if self.live_assistant.is_some() || self.status.starts_with("Running") {
+            parts.push("Composing reply".to_string());
+        }
+
+        if let Some(status_since) = self.status_since {
+            parts.push(format_elapsed(status_since.elapsed()));
+        }
         parts.join(" · ")
     }
 
