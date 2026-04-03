@@ -517,7 +517,9 @@ impl TuiApp {
 
 #[derive(Default)]
 struct TuiState {
-    blocks: Vec<RenderBlock>,
+    committed_blocks: Vec<RenderBlock>,
+    live_assistant: Option<RenderBlock>,
+    live_tool: Option<RenderBlock>,
     input: String,
     cursor: usize,
     status: String,
@@ -527,8 +529,6 @@ struct TuiState {
     latest_usage: Option<Usage>,
     viewport_width: u16,
     viewport_height: u16,
-    active_assistant: Option<usize>,
-    active_tool: Option<usize>,
     scroll_top: usize,
     follow_output: bool,
     unseen_output_lines: usize,
@@ -631,7 +631,7 @@ mod tests {
         app.push_system_note("first line\nsecond line");
 
         assert_eq!(
-            block_texts(app.state.blocks.last().unwrap()),
+            block_texts(app.state.committed_blocks.last().unwrap()),
             vec![
                 "· first line".to_string(),
                 "· second line".to_string(),
@@ -940,8 +940,26 @@ impl TuiState {
 
     fn render_lines(&self) -> Vec<StyledLine> {
         let mut lines = Vec::new();
-        for (index, block) in self.blocks.iter().enumerate() {
-            if index > 0 && block.kind != BlockKind::System {
+        let mut has_previous_block = false;
+
+        for block in &self.committed_blocks {
+            if has_previous_block && block.kind != BlockKind::System {
+                lines.push(StyledLine::blank());
+            }
+            lines.extend(block.lines.iter().cloned());
+            has_previous_block = true;
+        }
+
+        if let Some(block) = &self.live_assistant {
+            if has_previous_block && block.kind != BlockKind::System {
+                lines.push(StyledLine::blank());
+            }
+            lines.extend(block.lines.iter().cloned());
+            has_previous_block = true;
+        }
+
+        if let Some(block) = &self.live_tool {
+            if has_previous_block && block.kind != BlockKind::System {
                 lines.push(StyledLine::blank());
             }
             lines.extend(block.lines.iter().cloned());
@@ -1088,37 +1106,37 @@ impl TuiState {
     }
 
     fn push_user_input(&mut self, text: &str) {
-        self.blocks.push(RenderBlock {
+        self.committed_blocks.push(RenderBlock {
             lines: message_lines(USER_PREFIX, text, LineKind::User),
             kind: BlockKind::Conversation,
         });
-        self.active_assistant = None;
-        self.active_tool = None;
+        self.live_assistant = None;
+        self.live_tool = None;
     }
 
     fn push_message(&mut self, message: &AgentMessage) {
-        self.blocks.push(RenderBlock {
+        self.committed_blocks.push(RenderBlock {
             lines: format_message(message),
             kind: classify_block_from_message(message),
         });
-        self.active_assistant = None;
-        self.active_tool = None;
+        self.live_assistant = None;
+        self.live_tool = None;
     }
 
     fn push_system_note(&mut self, note: impl Into<String>) {
         let note = note.into();
-        self.blocks.push(RenderBlock {
+        self.committed_blocks.push(RenderBlock {
             lines: message_lines("· ", &note, LineKind::System),
             kind: BlockKind::System,
         });
-        self.active_assistant = None;
-        self.active_tool = None;
+        self.live_assistant = None;
+        self.live_tool = None;
     }
 
     fn replace_messages(&mut self, messages: &[AgentMessage]) {
-        self.blocks.clear();
-        self.active_assistant = None;
-        self.active_tool = None;
+        self.committed_blocks.clear();
+        self.live_assistant = None;
+        self.live_tool = None;
         self.scroll_top = 0;
         self.follow_output = true;
         self.unseen_output_lines = 0;
@@ -1137,77 +1155,76 @@ impl TuiState {
             AgentEvent::TurnStart => {}
             AgentEvent::MessageStart { role } => match role {
                 agent_model::LlmRole::Assistant => {
-                    self.blocks.push(RenderBlock {
+                    self.live_assistant = Some(RenderBlock {
                         lines: vec![StyledLine::new("", LineKind::Plain)],
                         kind: BlockKind::Conversation,
                     });
-                    self.active_assistant = Some(self.blocks.len() - 1);
                 }
                 agent_model::LlmRole::User | agent_model::LlmRole::System => {}
                 agent_model::LlmRole::Tool => {
-                    self.blocks.push(RenderBlock {
+                    self.live_tool = Some(RenderBlock {
                         lines: vec![StyledLine::new("· tool", LineKind::Tool)],
                         kind: BlockKind::Tool,
                     });
-                    self.active_tool = Some(self.blocks.len() - 1);
                 }
             },
             AgentEvent::TextDelta(delta) => {
-                if let Some(index) = self.active_assistant {
-                    append_text_to_block(&mut self.blocks[index], "", &delta);
+                if let Some(block) = self.live_assistant.as_mut() {
+                    append_text_to_block(block, "", &delta);
                 } else {
-                    self.blocks.push(RenderBlock {
+                    self.live_assistant = Some(RenderBlock {
                         lines: vec![StyledLine::new(delta, LineKind::Plain)],
                         kind: BlockKind::Conversation,
                     });
                 }
             }
             AgentEvent::ToolCallStart { id, name } => {
-                self.blocks.push(RenderBlock {
+                self.live_tool = Some(RenderBlock {
                     lines: vec![StyledLine::new(format!("· tool {name} ({id})"), LineKind::Tool)],
                     kind: BlockKind::Tool,
                 });
-                self.active_tool = Some(self.blocks.len() - 1);
             }
             AgentEvent::ToolCallArgsDelta { delta, .. } => {
-                if let Some(index) = self.active_tool {
-                    append_text_to_block(&mut self.blocks[index], "  ", &delta);
+                if let Some(block) = self.live_tool.as_mut() {
+                    append_text_to_block(block, "  ", &delta);
                 }
             }
             AgentEvent::ToolCallEnd { id } => {
-                if let Some(index) = self.active_tool.take() {
-                    self.blocks[index]
-                        .lines
-                        .push(StyledLine::new(format!("  done {id}"), LineKind::Tool));
+                if let Some(block) = self.live_tool.as_mut() {
+                    block.lines.push(StyledLine::new(format!("  done {id}"), LineKind::Tool));
                 }
             }
             AgentEvent::MessageEnd { message, .. } => match message.role {
                 agent_model::LlmRole::Assistant => {
-                    if let Some(index) = self.active_assistant.take() {
-                        self.blocks[index].lines = format_message(&AgentMessage::Assistant(message));
-                    }
+                    self.live_assistant = None;
+                    self.committed_blocks.push(RenderBlock {
+                        lines: format_message(&AgentMessage::Assistant(message)),
+                        kind: BlockKind::Conversation,
+                    });
                 }
                 agent_model::LlmRole::Tool => {
-                    if let Some(index) = self.active_tool.take() {
-                        self.blocks[index].lines = format_message(&AgentMessage::ToolResult(message));
-                    }
+                    self.live_tool = None;
+                    self.committed_blocks.push(RenderBlock {
+                        lines: format_message(&AgentMessage::ToolResult(message)),
+                        kind: BlockKind::Tool,
+                    });
                 }
                 agent_model::LlmRole::User | agent_model::LlmRole::System => {}
             },
             AgentEvent::ToolResultReady { message } => {
-                self.blocks.push(RenderBlock {
+                self.committed_blocks.push(RenderBlock {
                     lines: format_message(&AgentMessage::ToolResult(message)),
                     kind: BlockKind::Tool,
                 });
-                self.active_tool = None;
+                self.live_tool = None;
             }
             AgentEvent::Usage(usage) => {
                 self.latest_usage = Some(usage);
             }
             AgentEvent::TurnEnd { .. } => {}
             AgentEvent::AgentEnd => {
-                self.active_assistant = None;
-                self.active_tool = None;
+                self.live_assistant = None;
+                self.live_tool = None;
             }
         }
     }
