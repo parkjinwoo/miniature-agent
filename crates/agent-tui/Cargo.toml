@@ -1,0 +1,13 @@
+[package]
+name = "agent-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-model = { path = "../agent-model" }
+agent-core = { path = "../agent-core" }
+anyhow.workspace = true
+crossterm.workspace = true
+time.workspace = true
+unicode-width.workspace = true

@@ -1,0 +1,1 @@
+data: {"choices":[{"delta":{"reasoning":"I should inspect the file first.","content":"I'll inspect the file."},"finish_reason":null}]}

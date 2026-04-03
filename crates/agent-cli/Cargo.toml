@@ -1,0 +1,23 @@
+[package]
+name = "agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+agent-model = { path = "../agent-model" }
+agent-session = { path = "../agent-session" }
+agent-tui = { path = "../agent-tui" }
+agent-tools = { path = "../agent-tools" }
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
