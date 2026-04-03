@@ -390,8 +390,8 @@ impl TuiApp {
         self.state.viewport_width = width;
         self.state.viewport_height = height;
 
-        let raw_lines = self.state.render_lines();
-        let wrapped_lines = wrap_lines(&raw_lines, width as usize);
+        let committed_lines = self.state.render_committed_lines(width as usize);
+        let live_lines = self.state.render_live_lines(width as usize);
 
         let input_lines = render_input_lines(&self.state.input, width as usize);
         let editor_height = input_lines.len().max(1) as u16;
@@ -408,13 +408,25 @@ impl TuiApp {
             None
         };
         let hint_row = bottom_divider_row.saturating_add(1);
-        let log_height = status_row.unwrap_or(top_divider_row) as usize;
-        self.state.update_rendered_lines(wrapped_lines, log_height);
+        let total_log_height = status_row.unwrap_or(top_divider_row) as usize;
+        let live_reserved = live_lines.len().min(total_log_height.saturating_sub(1));
+        let committed_log_height = total_log_height.saturating_sub(live_reserved);
+
+        self.state
+            .update_rendered_lines(committed_lines, committed_log_height);
         let visible_lines = self.state.visible_log_lines();
 
         let mut frame = vec![StyledLine::blank(); height as usize];
         for (index, line) in visible_lines.iter().enumerate() {
             frame[index] = line.with_text(clip_to_width(&line.text, width as usize));
+        }
+
+        let live_start = visible_lines.len();
+        for (offset, line) in live_lines.iter().take(live_reserved).enumerate() {
+            let row = live_start + offset;
+            if row < total_log_height {
+                frame[row] = line.with_text(clip_to_width(&line.text, width as usize));
+            }
         }
 
         let hint_text = self.state.hint_line();
@@ -938,33 +950,34 @@ impl TuiState {
         self.cursor = cursor_for_row_col(&chars, target_row, col);
     }
 
-    fn render_lines(&self) -> Vec<StyledLine> {
-        let mut lines = Vec::new();
+    fn render_committed_lines(&self, width: usize) -> Vec<StyledLine> {
+        let mut raw_lines = Vec::new();
+        for (index, block) in self.committed_blocks.iter().enumerate() {
+            if index > 0 && block.kind != BlockKind::System {
+                raw_lines.push(StyledLine::blank());
+            }
+            raw_lines.extend(block.lines.iter().cloned());
+        }
+        wrap_lines(&raw_lines, width)
+    }
+
+    fn render_live_lines(&self, width: usize) -> Vec<StyledLine> {
+        let mut raw_lines = Vec::new();
         let mut has_previous_block = false;
 
-        for block in &self.committed_blocks {
-            if has_previous_block && block.kind != BlockKind::System {
-                lines.push(StyledLine::blank());
-            }
-            lines.extend(block.lines.iter().cloned());
-            has_previous_block = true;
-        }
-
         if let Some(block) = &self.live_assistant {
-            if has_previous_block && block.kind != BlockKind::System {
-                lines.push(StyledLine::blank());
-            }
-            lines.extend(block.lines.iter().cloned());
+            raw_lines.extend(block.lines.iter().cloned());
             has_previous_block = true;
         }
 
         if let Some(block) = &self.live_tool {
             if has_previous_block && block.kind != BlockKind::System {
-                lines.push(StyledLine::blank());
+                raw_lines.push(StyledLine::blank());
             }
-            lines.extend(block.lines.iter().cloned());
+            raw_lines.extend(block.lines.iter().cloned());
         }
-        lines
+
+        wrap_lines(&raw_lines, width)
     }
 
     fn visible_log_lines(&self) -> &[StyledLine] {
