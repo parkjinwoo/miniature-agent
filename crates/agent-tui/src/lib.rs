@@ -37,6 +37,8 @@ pub struct TuiApp {
     last_bottom_height: usize,
     last_cursor_row_in_bottom: usize,
     was_overlay_active: bool,
+    streamed_assistant: bool,
+    assistant_line_open: bool,
 }
 
 impl TuiApp {
@@ -49,6 +51,8 @@ impl TuiApp {
             last_bottom_height: 0,
             last_cursor_row_in_bottom: 0,
             was_overlay_active: false,
+            streamed_assistant: false,
+            assistant_line_open: false,
         })
     }
 
@@ -59,6 +63,8 @@ impl TuiApp {
         self.last_bottom_height = 0;
         self.last_cursor_row_in_bottom = 0;
         self.was_overlay_active = false;
+        self.streamed_assistant = false;
+        self.assistant_line_open = false;
         self.render()
     }
 
@@ -67,6 +73,7 @@ impl TuiApp {
     }
 
     pub fn push_event(&mut self, event: AgentEvent) {
+        self.maybe_stream_terminal_native_event(&event);
         self.state.apply_event(event);
     }
 
@@ -87,6 +94,8 @@ impl TuiApp {
         self.printed_committed_blocks = 0;
         self.last_bottom_height = 0;
         self.last_cursor_row_in_bottom = 0;
+        self.streamed_assistant = false;
+        self.assistant_line_open = false;
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -412,6 +421,8 @@ impl TuiApp {
             self.printed_committed_blocks = 0;
             self.last_bottom_height = 0;
             self.last_cursor_row_in_bottom = 0;
+            self.streamed_assistant = false;
+            self.assistant_line_open = false;
             queue!(self.terminal.stdout, MoveTo(0, 0), Clear(ClearType::All))?;
             self.terminal.stdout.flush()?;
         }
@@ -576,7 +587,7 @@ impl TuiApp {
 
     fn build_terminal_native_bottom(&self, width: usize) -> BottomFrame {
         let mut lines = Vec::new();
-        let live_lines = self.state.render_live_lines(width);
+        let live_lines = self.state.render_live_tool_lines(width);
         if !live_lines.is_empty() {
             let tail_start = live_lines.len().saturating_sub(2);
             lines.extend(
@@ -622,6 +633,39 @@ impl TuiApp {
             lines,
             cursor_row: cursor_row as usize,
             cursor_col,
+        }
+    }
+
+    fn maybe_stream_terminal_native_event(&mut self, event: &AgentEvent) {
+        if !self.terminal.entered || !self.state.selection_items.is_empty() {
+            return;
+        }
+
+        match event {
+            AgentEvent::TextDelta(delta) => {
+                let _ = self.clear_previous_bottom_block();
+                let _ = apply_style(&mut self.terminal.stdout, LineKind::Plain);
+                let _ = queue!(self.terminal.stdout, Print(delta), ResetColor);
+                let _ = self.terminal.stdout.flush();
+                self.streamed_assistant = true;
+                self.assistant_line_open = !delta.ends_with('\n');
+            }
+            AgentEvent::MessageEnd { message, .. }
+                if message.role == agent_model::LlmRole::Assistant && self.streamed_assistant =>
+            {
+                if self.assistant_line_open {
+                    let _ = queue!(self.terminal.stdout, Print("\r\n"));
+                }
+                let _ = self.terminal.stdout.flush();
+                self.streamed_assistant = false;
+                self.assistant_line_open = false;
+                self.printed_committed_blocks = self.state.committed_blocks.len().saturating_add(1);
+            }
+            AgentEvent::AgentEnd => {
+                self.streamed_assistant = false;
+                self.assistant_line_open = false;
+            }
+            _ => {}
         }
     }
 
@@ -1167,6 +1211,14 @@ impl TuiState {
             raw_lines.extend(block.lines.iter().cloned());
         }
 
+        wrap_lines(&raw_lines, width)
+    }
+
+    fn render_live_tool_lines(&self, width: usize) -> Vec<StyledLine> {
+        let mut raw_lines = Vec::new();
+        if let Some(block) = &self.live_tool {
+            raw_lines.extend(block.lines.iter().cloned());
+        }
         wrap_lines(&raw_lines, width)
     }
 
