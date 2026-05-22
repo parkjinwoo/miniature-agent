@@ -605,10 +605,10 @@ impl TuiState {
             let mut assistant_lines = wrap_lines(&block.lines, width);
             assistant_lines.retain(|line| !line.text.trim().is_empty());
             if !assistant_lines.is_empty() {
-                lines.push(StyledLine::blank());
-                lines.push(StyledLine::new("Reply preview", LineKind::Hint));
-                let keep = assistant_lines.len().saturating_sub(3);
-                lines.extend(assistant_lines.drain(keep..));
+                if !lines.is_empty() {
+                    lines.push(StyledLine::blank());
+                }
+                lines.extend(assistant_lines);
             }
         }
 
@@ -1308,6 +1308,31 @@ mod tests {
         assert!(texts[3].contains("usage n/a"));
         assert_eq!(cursor_row, 2);
         assert_eq!(cursor_col, INPUT_PREFIX_WIDTH + 5);
+    }
+
+    #[test]
+    fn bottom_frame_uses_available_space_for_live_assistant_output() {
+        let mut state = TuiState::default();
+        state.set_status("Running");
+        state.apply_event(AgentEvent::MessageStart {
+            role: agent_model::LlmRole::Assistant,
+        });
+        state.apply_event(AgentEvent::TextDelta(
+            "one\ntwo\nthree\nfour\nfive".to_string(),
+        ));
+
+        let (lines, _, _) = bottom_lines(&state, 30, 10);
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(texts.contains(&"one"));
+        assert!(texts.contains(&"two"));
+        assert!(texts.contains(&"three"));
+        assert!(texts.contains(&"four"));
+        assert!(texts.contains(&"five"));
+        assert!(!texts.contains(&"Reply preview"));
     }
 
     #[test]
