@@ -975,11 +975,8 @@ fn bottom_lines(state: &TuiState, width: usize, height: usize) -> (Vec<StyledLin
         lines = lines.split_off(lines.len() - height);
     }
 
-    let pad_top = height.saturating_sub(lines.len());
-    if pad_top > 0 {
-        let mut padded = vec![StyledLine::blank(); pad_top];
-        padded.extend(lines);
-        lines = padded;
+    while lines.len() < height {
+        lines.push(StyledLine::blank());
     }
 
     let (cursor_row, cursor_col) = cursor_position_for_input(&state.input, state.cursor, width, 0);
@@ -989,7 +986,7 @@ fn bottom_lines(state: &TuiState, width: usize, height: usize) -> (Vec<StyledLin
             .saturating_sub(input_start)
             .saturating_sub(1),
     );
-    let row = pad_top + input_row_offset + visible_cursor_row;
+    let row = input_row_offset + visible_cursor_row;
 
     (lines, row, cursor_col)
 }
@@ -1291,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_frame_keeps_prompt_at_bottom_when_idle() {
+    fn bottom_frame_keeps_prompt_adjacent_to_transcript_when_idle() {
         let state = TuiState {
             input: "hello".to_string(),
             cursor: 5,
@@ -1304,9 +1301,9 @@ mod tests {
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(texts[2], "> hello");
-        assert!(texts[3].contains("usage n/a"));
-        assert_eq!(cursor_row, 2);
+        assert_eq!(texts[0], "> hello");
+        assert!(texts[1].contains("usage n/a"));
+        assert_eq!(cursor_row, 0);
         assert_eq!(cursor_col, INPUT_PREFIX_WIDTH + 5);
     }
 
