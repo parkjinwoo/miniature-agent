@@ -11,6 +11,7 @@ This checklist defines the current ratatui regression baseline.
   - prompt and footer stay in the bottom pane
   - multiline input does not push all live output away
   - queued prompt preview appears in the bottom pane while a run is active
+  - wrapped and wide-character input keeps vertical cursor movement stable
   - wide overlay pickers show the selected item and preview column
   - provider mismatch text is split into readable overlay header lines
 
@@ -34,7 +35,7 @@ Run from the workspace root with a real provider configuration.
    - Queued prompt is submitted after the active run completes.
 5. `/sessions`:
    - Current selection is highlighted.
-   - Provider/model mismatch markers remain readable.
+   - Provider/model/cwd and mismatch markers remain readable.
    - Wide terminals show a small preview column.
 6. `/tree`:
    - Current checkpoint is highlighted.
@@ -52,4 +53,3 @@ Run from the workspace root with a real provider configuration.
 - Live tail: active assistant text and active tool log only.
 - Bottom pane: queued prompt, editable input, status, footer, usage, and time.
 - Overlay: modal selection UI; it may redraw the full inline viewport.
-

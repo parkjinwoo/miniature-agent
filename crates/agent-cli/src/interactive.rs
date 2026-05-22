@@ -18,6 +18,8 @@ use crate::session_ui::{
 use crate::compaction::{compact_session, maybe_auto_compact};
 use crate::runtime::AppBackend;
 
+const PROVIDER_MISMATCH_STATUS: &str = "Provider mismatch · /fork recommended";
+
 pub(crate) struct InteractiveConfig<'a> {
     pub session_dir: &'a Path,
     pub app_paths: &'a AppPaths,
@@ -123,7 +125,7 @@ pub(crate) async fn run_interactive(
                     Ok(Err(error)) => {
                         let mut guard = agent.lock().await;
                         guard.set_state(snapshot.clone());
-                        tui.push_system_note(format!("run failed: {error}"));
+                        tui.push_system_note(format!("run failed; restored previous state: {error}"));
                         tui.set_status("Run failed");
                         tui.redraw()?;
                         failed = true;
@@ -132,7 +134,7 @@ pub(crate) async fn run_interactive(
                     Err(error) => {
                         let mut guard = agent.lock().await;
                         guard.set_state(snapshot.clone());
-                        tui.push_system_note(format!("run task failed: {error}"));
+                        tui.push_system_note(format!("run task failed; restored previous state: {error}"));
                         tui.set_status("Run failed");
                         tui.redraw()?;
                         failed = true;
@@ -146,7 +148,7 @@ pub(crate) async fn run_interactive(
                     handle.abort();
                     let mut guard = agent.lock().await;
                     guard.set_state(snapshot.clone());
-                    tui.push_system_note("run aborted");
+                    tui.push_system_note("run aborted; partial response discarded");
                     tui.set_status("Aborted");
                     tui.redraw()?;
                     aborted = true;
@@ -248,7 +250,7 @@ async fn try_handle_local_command(
                 }
                 None => {
                     tui.push_system_note(format!(
-                        "compaction skipped: keep_last={} leaves too little to compact",
+                        "compaction skipped: keep_last={} leaves no older messages to summarize",
                         keep_last
                     ));
                     tui.set_status("Compaction skipped");
@@ -478,13 +480,13 @@ fn append_provider_mismatch_note(
         session_provider_name,
         mismatches.join("\n")
     ));
-    tui.set_status("Provider mismatch, /fork recommended");
+    tui.set_status(PROVIDER_MISMATCH_STATUS);
 }
 
 fn set_prompt_status(tui: &mut TuiApp, session: &SessionStore, provider_spec: &ProviderSpec) {
     if let Some(session_provider) = session.header().provider.as_ref() {
         if !provider_spec.mismatch_lines(session_provider).is_empty() {
-            tui.set_status("Provider mismatch, /fork recommended");
+            tui.set_status(PROVIDER_MISMATCH_STATUS);
             return;
         }
     }

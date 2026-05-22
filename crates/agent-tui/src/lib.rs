@@ -1,4 +1,4 @@
-use std::io::{stdout, Stdout};
+use std::io::{Stdout, stdout};
 use std::time::{Duration, Instant};
 
 use agent_core::{AgentEvent, AgentMessage};
@@ -21,7 +21,10 @@ use time::OffsetDateTime;
 use time::UtcOffset;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use bottom_pane::{cursor_position_for_input, render_input_lines, wrap_line_by_display_width};
+use bottom_pane::{
+    cursor_position_for_input, move_cursor_vertical_by_display_rows, render_input_lines,
+    wrap_line_by_display_width,
+};
 use conversation::{
     append_text_to_block, classify_block_from_message, format_message, message_lines,
 };
@@ -37,6 +40,7 @@ const INPUT_CONTINUATION_PREFIX: &str = "  ";
 const INPUT_PREFIX_WIDTH: usize = 2;
 const SELECTION_PREVIEW_MIN_WIDTH: usize = 72;
 const MAX_TRANSCRIPT_TOOL_OUTPUT_LINES: usize = 8;
+const FALLBACK_VIEWPORT_WIDTH: usize = 80;
 const USER_PREFIX: &str = "▌  ";
 
 type RatTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -64,6 +68,7 @@ impl TuiApp {
             state: TuiState {
                 viewport_width,
                 viewport_height,
+                inline_viewport_height: viewport_height,
                 ..Default::default()
             },
             printed_committed_blocks: 0,
@@ -220,8 +225,7 @@ impl TuiApp {
                 },
                 Event::Mouse(mouse) => self.handle_mouse_in_selection(mouse),
                 Event::Resize(width, height) => {
-                    self.state.viewport_width = width;
-                    self.state.viewport_height = height;
+                    self.state.resize_viewport(width, height);
                 }
                 _ => {}
             }
@@ -245,8 +249,7 @@ impl TuiApp {
                 Ok(RunningAction::Continue)
             }
             Event::Resize(width, height) => {
-                self.state.viewport_width = width;
-                self.state.viewport_height = height;
+                self.state.resize_viewport(width, height);
                 Ok(RunningAction::Continue)
             }
             _ => Ok(RunningAction::Continue),
@@ -273,8 +276,7 @@ impl TuiApp {
                 Ok(Some(PromptAction::Continue))
             }
             Event::Resize(width, height) => {
-                self.state.viewport_width = width;
-                self.state.viewport_height = height;
+                self.state.resize_viewport(width, height);
                 Ok(None)
             }
             _ => Ok(None),
@@ -439,6 +441,7 @@ struct TuiState {
     latest_usage: Option<Usage>,
     viewport_width: u16,
     viewport_height: u16,
+    inline_viewport_height: u16,
     selection_title: Option<String>,
     selection_items: Vec<String>,
     selection_index: usize,
@@ -518,6 +521,16 @@ impl TuiState {
         }
     }
 
+    fn resize_viewport(&mut self, width: u16, terminal_rows: u16) {
+        self.viewport_width = width;
+        let inline_height = if self.inline_viewport_height == 0 {
+            inline_viewport_height_for_rows(terminal_rows)
+        } else {
+            self.inline_viewport_height
+        };
+        self.viewport_height = terminal_rows.min(inline_height).max(1);
+    }
+
     fn insert_char(&mut self, ch: char) {
         let byte = char_to_byte_index(&self.input, self.cursor);
         self.input.insert(byte, ch);
@@ -581,15 +594,20 @@ impl TuiState {
     }
 
     fn move_vertical(&mut self, direction: isize) {
-        let chars: Vec<char> = self.input.chars().collect();
-        let cursor = self.cursor.min(chars.len());
-        let (row, col) = row_col_for_cursor(&chars, cursor);
-        let target_row = if direction < 0 {
-            row.saturating_sub(direction.unsigned_abs())
+        self.cursor = move_cursor_vertical_by_display_rows(
+            &self.input,
+            self.cursor,
+            self.input_view_width(),
+            direction,
+        );
+    }
+
+    fn input_view_width(&self) -> usize {
+        if self.viewport_width == 0 {
+            FALLBACK_VIEWPORT_WIDTH
         } else {
-            row.saturating_add(direction as usize)
-        };
-        self.cursor = cursor_for_row_col(&chars, target_row, col);
+            self.viewport_width as usize
+        }
     }
 
     fn render_committed_lines_from(&self, width: usize, start_block: usize) -> Vec<StyledLine> {
@@ -674,6 +692,35 @@ impl TuiState {
             (true, false) => footer,
             (true, true) => String::new(),
         }
+    }
+
+    fn info_line_for_width(&self, width: usize) -> String {
+        let full = self.info_line();
+        if full.is_empty() || display_width(&full) <= width {
+            return full;
+        }
+
+        let mut parts = Vec::new();
+        let status = self.status_line();
+        if !status.is_empty() {
+            parts.push(status);
+        }
+        if !self.footer_model.is_empty() {
+            parts.push(self.footer_model.clone());
+        }
+        if let Some(usage) = &self.latest_usage {
+            let total = usage.input_tokens + usage.output_tokens;
+            parts.push(format!("{} tok", format_token_count(total)));
+        } else {
+            parts.push("usage n/a".to_string());
+        }
+        parts.push(current_time_label());
+        if !self.footer_path.is_empty() {
+            parts.push(self.footer_path.clone());
+        }
+
+        join_parts_to_width(parts.iter().map(String::as_str), width)
+            .unwrap_or_else(|| truncate_to_display_width(&full, width))
     }
 
     fn footer_info_line(&self) -> String {
@@ -944,7 +991,7 @@ fn bottom_lines(state: &TuiState, width: usize, height: usize) -> (Vec<StyledLin
 fn bottom_surface(state: &TuiState, width: usize, height: usize) -> BottomSurface {
     let width = width.max(1);
     let height = height.max(1);
-    let info_line = state.info_line();
+    let info_line = state.info_line_for_width(width);
     let info_rows = usize::from(!info_line.is_empty() && height >= 2);
     let queued_lines = if height >= 3 {
         queued_preview_lines(state, width)
@@ -1182,7 +1229,7 @@ fn selection_column_widths(width: usize, has_preview: bool) -> (usize, usize) {
 fn selection_preview_lines(state: &TuiState, width: usize, max_rows: usize) -> Vec<String> {
     let mut raw_lines = Vec::new();
     raw_lines.push(format!(
-        "Selected {}/{}",
+        "Current {}/{}",
         state.selection_index + 1,
         state.selection_items.len()
     ));
@@ -1304,6 +1351,33 @@ fn truncate_to_display_width(text: &str, width: usize) -> String {
     clipped
 }
 
+fn join_parts_to_width<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+    width: usize,
+) -> Option<String> {
+    let width = width.max(1);
+    let mut line = String::new();
+
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+
+        let candidate = if line.is_empty() {
+            part.to_string()
+        } else {
+            format!("{line} · {part}")
+        };
+        if display_width(&candidate) <= width {
+            line = candidate;
+        } else if line.is_empty() {
+            return Some(truncate_to_display_width(part, width));
+        }
+    }
+
+    if line.is_empty() { None } else { Some(line) }
+}
+
 fn char_to_byte_index(text: &str, char_index: usize) -> usize {
     if char_index == 0 {
         return 0;
@@ -1312,43 +1386,6 @@ fn char_to_byte_index(text: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(index, _)| index)
         .unwrap_or(text.len())
-}
-
-fn row_col_for_cursor(chars: &[char], cursor: usize) -> (usize, usize) {
-    let mut row = 0;
-    let mut col = 0;
-    for ch in chars.iter().take(cursor) {
-        if *ch == '\n' {
-            row += 1;
-            col = 0;
-        } else {
-            col += display_width_char(*ch);
-        }
-    }
-    (row, col)
-}
-
-fn cursor_for_row_col(chars: &[char], target_row: usize, target_col: usize) -> usize {
-    let mut row = 0;
-    let mut col = 0;
-
-    for (index, ch) in chars.iter().enumerate() {
-        if row == target_row && col == target_col {
-            return index;
-        }
-
-        if *ch == '\n' {
-            if row == target_row {
-                return index;
-            }
-            row += 1;
-            col = 0;
-        } else {
-            col += display_width_char(*ch);
-        }
-    }
-
-    chars.len()
 }
 
 fn display_width(text: &str) -> usize {
@@ -1584,10 +1621,69 @@ mod tests {
     }
 
     #[test]
+    fn vertical_cursor_movement_uses_wrapped_display_rows() {
+        let mut state = TuiState {
+            input: "abcdefghi".to_string(),
+            cursor: "abcdefghi".chars().count(),
+            viewport_width: 8,
+            ..Default::default()
+        };
+
+        state.move_vertical(-1);
+        assert_eq!(state.cursor, 3);
+
+        state.move_vertical(1);
+        assert_eq!(state.cursor, 9);
+    }
+
+    #[test]
+    fn vertical_cursor_movement_handles_wide_char_boundaries() {
+        let mut state = TuiState {
+            input: "ab한글cd".to_string(),
+            cursor: "ab한글cd".chars().count(),
+            viewport_width: 8,
+            ..Default::default()
+        };
+
+        state.move_vertical(-1);
+        assert_eq!(state.cursor, 2);
+
+        state.move_vertical(1);
+        assert_eq!(state.cursor, "ab한글cd".chars().count());
+    }
+
+    #[test]
     fn token_count_is_compactly_formatted() {
         assert_eq!(format_token_count(999), "999");
         assert_eq!(format_token_count(1_500), "1.5k");
         assert_eq!(format_token_count(2_500_000), "2.5m");
+    }
+
+    #[test]
+    fn footer_line_prioritizes_status_and_model_when_narrow() {
+        let mut state = TuiState {
+            footer_path: "/very/long/workspace/path/that/should/drop/first".to_string(),
+            footer_model: "openai/gpt-4.1".to_string(),
+            latest_usage: Some(Usage {
+                input_tokens: 1000,
+                output_tokens: 500,
+            }),
+            ..Default::default()
+        };
+        state.set_status("Running");
+
+        let line = state.info_line_for_width(42);
+
+        assert!(line.contains("Working"));
+        assert!(line.contains("openai/gpt-4.1"));
+        assert!(!line.contains("/very/long"));
+    }
+
+    #[test]
+    fn footer_line_keeps_usage_when_idle_and_tight() {
+        let state = TuiState::default();
+
+        assert_eq!(state.info_line_for_width(10), "usage n/a");
     }
 
     #[test]
@@ -1604,6 +1700,24 @@ mod tests {
             inline_viewport_height_for_rows(80),
             MAX_INLINE_VIEWPORT_HEIGHT
         );
+    }
+
+    #[test]
+    fn resize_viewport_tracks_visible_inline_height() {
+        let mut state = TuiState {
+            viewport_width: 80,
+            viewport_height: 14,
+            inline_viewport_height: 14,
+            ..Default::default()
+        };
+
+        state.resize_viewport(120, 5);
+        assert_eq!(state.viewport_width, 120);
+        assert_eq!(state.viewport_height, 5);
+
+        state.resize_viewport(100, 40);
+        assert_eq!(state.viewport_width, 100);
+        assert_eq!(state.viewport_height, 14);
     }
 
     #[test]
@@ -1636,10 +1750,12 @@ mod tests {
         assert!(matches!(action, RunningAction::QueueSubmit(text) if text == "next\nprompt"));
         assert_eq!(state.queued_input.as_deref(), Some("next\nprompt"));
         let surface = bottom_surface(&state, 40, 5);
-        assert!(surface
-            .lines
-            .iter()
-            .any(|line| line.text == "Queued next: next / prompt"));
+        assert!(
+            surface
+                .lines
+                .iter()
+                .any(|line| line.text == "Queued next: next / prompt")
+        );
     }
 
     #[test]
@@ -1714,9 +1830,11 @@ mod tests {
         assert!(surface.live_rows > 0);
         assert!(surface.input_rows <= 2);
         assert!(texts.contains(&"five"));
-        assert!(texts
-            .iter()
-            .any(|line| line.starts_with("> ") || line.starts_with("  ")));
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.starts_with("> ") || line.starts_with("  "))
+        );
     }
 
     #[test]
@@ -1772,7 +1890,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(surface.has_preview);
-        assert!(texts.iter().any(|line| line.contains("│ Selected 2/2")));
+        assert!(texts.iter().any(|line| line.contains("│ Current 2/2")));
         assert!(texts[surface.selected_row].contains("session-b"));
     }
 
@@ -1799,9 +1917,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(texts[0], "Session provider differs");
-        assert!(texts
-            .iter()
-            .any(|line| line.contains("runtime=openai/gpt-4.1")));
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("runtime=openai/gpt-4.1"))
+        );
         assert!(texts[surface.selected_row].contains("Fork with current provider"));
     }
 

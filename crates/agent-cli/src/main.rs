@@ -202,6 +202,7 @@ default_model = "local-model"
         let rendered_match = format_session_summary_line(&matching, Some(&spec));
         let rendered_mismatch = format_session_summary_line(&mismatched, Some(&spec));
         assert!(rendered_match.starts_with("= "));
+        assert!(rendered_match.contains("cwd=workspace"));
         assert!(rendered_mismatch.starts_with("! "));
         assert!(rendered_mismatch.contains("diff="));
 

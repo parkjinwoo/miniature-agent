@@ -36,6 +36,27 @@ pub(crate) fn cursor_position_for_input(
     (row, col.min(width.saturating_sub(1)))
 }
 
+pub(crate) fn move_cursor_vertical_by_display_rows(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    direction: isize,
+) -> usize {
+    let content_width = width.saturating_sub(INPUT_PREFIX_WIDTH).max(1);
+    let chars = input.chars().collect::<Vec<_>>();
+    let positions = wrapped_cursor_positions(&chars, content_width);
+    let cursor = cursor.min(chars.len());
+    let (row, col) = positions[cursor];
+    let target_row = if direction < 0 {
+        row.saturating_sub(direction.unsigned_abs())
+    } else {
+        row.saturating_add(direction as usize)
+    };
+
+    cursor_for_wrapped_row_col(&positions, target_row, col)
+        .unwrap_or_else(|| if direction < 0 { 0 } else { chars.len() })
+}
+
 pub(crate) fn wrap_line_by_display_width(line: &str, width: usize) -> Vec<String> {
     let max_width = width.max(1);
     let mut wrapped = Vec::new();
@@ -98,6 +119,50 @@ fn wrapped_row_col_for_cursor(
     }
 
     (row, col)
+}
+
+fn wrapped_cursor_positions(chars: &[char], content_width: usize) -> Vec<(usize, usize)> {
+    let width = content_width.max(1);
+    let mut positions = Vec::with_capacity(chars.len() + 1);
+    let mut row = 0;
+    let mut col = 0;
+    positions.push((row, col));
+
+    for ch in chars {
+        if *ch == '\n' {
+            row += 1;
+            col = 0;
+            positions.push((row, col));
+            continue;
+        }
+
+        let ch_width = display_width_char(*ch).max(1);
+        if col > 0 && col + ch_width > width {
+            row += 1;
+            col = 0;
+        }
+        col += ch_width;
+        if col >= width {
+            row += col / width;
+            col %= width;
+        }
+        positions.push((row, col));
+    }
+
+    positions
+}
+
+fn cursor_for_wrapped_row_col(
+    positions: &[(usize, usize)],
+    target_row: usize,
+    target_col: usize,
+) -> Option<usize> {
+    positions
+        .iter()
+        .enumerate()
+        .filter(|(_, (row, _))| *row == target_row)
+        .min_by_key(|(_, (_, col))| (col.abs_diff(target_col), usize::from(*col < target_col)))
+        .map(|(cursor, _)| cursor)
 }
 
 fn display_width_char(ch: char) -> usize {

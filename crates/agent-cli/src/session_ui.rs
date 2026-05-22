@@ -98,11 +98,12 @@ pub(crate) fn format_session_summary_line(
         .and_then(|stem| stem.to_str())
         .unwrap_or("session");
     format!(
-        "{} {}  {}  {}{}",
+        "{} {}  {}  {}  cwd={}{}",
         marker,
         format_short_timestamp(&session.created_at),
         session_provider_label(session),
         session_name,
+        compact_cwd_label(&session.cwd),
         mismatch_suffix
     )
 }
@@ -192,6 +193,15 @@ fn format_short_timestamp(timestamp: &str) -> String {
         .get(2..19)
         .map(|value| value.replace('T', " "))
         .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn compact_cwd_label(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(cwd)
+        .to_string()
 }
 
 pub(crate) fn prioritize_matching_sessions(
