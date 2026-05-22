@@ -69,7 +69,11 @@ pub(crate) fn wrap_line_by_display_width(line: &str, width: usize) -> Vec<String
     wrapped
 }
 
-fn wrapped_row_col_for_cursor(chars: &[char], cursor: usize, content_width: usize) -> (usize, usize) {
+fn wrapped_row_col_for_cursor(
+    chars: &[char],
+    cursor: usize,
+    content_width: usize,
+) -> (usize, usize) {
     let width = content_width.max(1);
     let mut row = 0;
     let mut col = 0;

@@ -9,29 +9,29 @@ pub(crate) fn format_message(message: &AgentMessage) -> Vec<StyledLine> {
     for part in &llm.parts {
         match part {
             agent_model::MessagePart::Text(text) => match message {
-                AgentMessage::User(_) => {
-                    lines.extend(message_lines(crate::USER_PREFIX, &text.text, LineKind::User))
-                }
+                AgentMessage::User(_) => lines.extend(message_lines(
+                    crate::USER_PREFIX,
+                    &text.text,
+                    LineKind::User,
+                )),
                 AgentMessage::Assistant(_) => {
-                    lines.extend(message_lines("", &text.text, LineKind::Plain))
+                    lines.extend(message_lines("", &text.text, LineKind::Assistant))
                 }
-                AgentMessage::ToolResult(_) => {
-                    lines.extend(message_lines("  ", &text.text, LineKind::Tool))
-                }
+                AgentMessage::ToolResult(_) => lines.extend(technical_lines("  ", &text.text)),
             },
             agent_model::MessagePart::ToolCall(call) => {
                 lines.push(StyledLine::new(
                     format!("· tool call {}", call.name),
-                    LineKind::Tool,
+                    LineKind::ToolTitle,
                 ));
-                lines.extend(message_lines("  ", &call.arguments_json, LineKind::Tool));
+                lines.extend(technical_lines("  ", &call.arguments_json));
             }
             agent_model::MessagePart::ToolResult(result) => {
                 lines.push(StyledLine::new(
                     format!("· tool result {}", result.call_id),
-                    LineKind::Tool,
+                    LineKind::ToolTitle,
                 ));
-                lines.extend(message_lines("  ", &result.content, LineKind::Tool));
+                lines.extend(technical_lines("  ", &result.content));
             }
         }
     }
@@ -58,14 +58,37 @@ pub(crate) fn message_lines(prefix: &str, text: &str, kind: LineKind) -> Vec<Sty
     lines
 }
 
+fn technical_lines(prefix: &str, text: &str) -> Vec<StyledLine> {
+    let mut lines = message_lines(prefix, text, LineKind::Tool);
+    if lines.len() <= crate::MAX_TRANSCRIPT_TOOL_OUTPUT_LINES {
+        return lines;
+    }
+
+    let omitted = lines.len() - crate::MAX_TRANSCRIPT_TOOL_OUTPUT_LINES;
+    let mut tail = lines.split_off(omitted);
+    tail.insert(
+        0,
+        StyledLine::new(
+            format!("{prefix}... {omitted} earlier lines omitted"),
+            LineKind::Tool,
+        ),
+    );
+    tail
+}
+
 pub(crate) fn append_text_to_block(block: &mut RenderBlock, prefix: &str, delta: &str) {
     if block.lines.is_empty() {
-        let kind = if prefix.trim_start().starts_with('·') || prefix.starts_with("  ") {
-            LineKind::Tool
-        } else {
-            LineKind::Plain
-        };
+        let kind = stream_line_kind(prefix);
         block.lines.push(StyledLine::new(prefix, kind));
+    } else if !prefix.is_empty()
+        && block
+            .lines
+            .last()
+            .is_some_and(|line| !line.text.starts_with(prefix))
+    {
+        block
+            .lines
+            .push(StyledLine::new(prefix, stream_line_kind(prefix)));
     }
 
     let mut first = true;
@@ -79,14 +102,34 @@ pub(crate) fn append_text_to_block(block: &mut RenderBlock, prefix: &str, delta:
             }
             first = false;
         } else {
-            let kind = block.lines.last().map(|line| line.kind).unwrap_or(LineKind::Plain);
-            block.lines.push(StyledLine::new(format!("{prefix}{clean}"), kind));
+            let kind = block
+                .lines
+                .last()
+                .map(|line| line.kind)
+                .unwrap_or(LineKind::Assistant);
+            block
+                .lines
+                .push(StyledLine::new(format!("{prefix}{clean}"), kind));
         }
 
         if ends_with_newline {
-            let kind = block.lines.last().map(|line| line.kind).unwrap_or(LineKind::Plain);
+            let kind = block
+                .lines
+                .last()
+                .map(|line| line.kind)
+                .unwrap_or(LineKind::Assistant);
             block.lines.push(StyledLine::new(prefix, kind));
         }
+    }
+}
+
+fn stream_line_kind(prefix: &str) -> LineKind {
+    if prefix.trim_start().starts_with('·') {
+        LineKind::ToolTitle
+    } else if prefix.starts_with("  ") {
+        LineKind::Tool
+    } else {
+        LineKind::Assistant
     }
 }
 

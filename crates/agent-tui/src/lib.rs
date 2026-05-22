@@ -29,10 +29,14 @@ use conversation::{
 mod bottom_pane;
 mod conversation;
 
-const INLINE_VIEWPORT_HEIGHT: u16 = 12;
+const MIN_INLINE_VIEWPORT_HEIGHT: u16 = 10;
+const DEFAULT_INLINE_VIEWPORT_HEIGHT: u16 = 14;
+const MAX_INLINE_VIEWPORT_HEIGHT: u16 = 18;
 const INPUT_PREFIX: &str = "> ";
 const INPUT_CONTINUATION_PREFIX: &str = "  ";
 const INPUT_PREFIX_WIDTH: usize = 2;
+const SELECTION_PREVIEW_MIN_WIDTH: usize = 72;
+const MAX_TRANSCRIPT_TOOL_OUTPUT_LINES: usize = 8;
 const USER_PREFIX: &str = "▌  ";
 
 type RatTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -47,16 +51,21 @@ pub struct TuiApp {
 impl TuiApp {
     pub fn new() -> anyhow::Result<Self> {
         let backend = CrosstermBackend::new(stdout());
+        let (viewport_width, viewport_height) = initial_viewport_size();
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+                viewport: Viewport::Inline(viewport_height),
             },
         )?;
 
         Ok(Self {
             terminal,
-            state: TuiState::default(),
+            state: TuiState {
+                viewport_width,
+                viewport_height,
+                ..Default::default()
+            },
             printed_committed_blocks: 0,
             entered: false,
         })
@@ -197,15 +206,15 @@ impl TuiApp {
                         self.state.selection_index = (self.state.selection_index + 1).min(max);
                     }
                     KeyCode::PageUp => {
-                        self.state.selection_index = self
-                            .state
-                            .selection_index
-                            .saturating_sub(selection_page_size());
+                        let page_size = selection_page_size(self.state.viewport_height);
+                        self.state.selection_index =
+                            self.state.selection_index.saturating_sub(page_size);
                     }
                     KeyCode::PageDown => {
                         let max = self.state.selection_items.len().saturating_sub(1);
+                        let page_size = selection_page_size(self.state.viewport_height);
                         self.state.selection_index =
-                            (self.state.selection_index + selection_page_size()).min(max);
+                            (self.state.selection_index + page_size).min(max);
                     }
                     _ => {}
                 },
@@ -422,6 +431,7 @@ struct TuiState {
     live_tool: Option<RenderBlock>,
     input: String,
     cursor: usize,
+    queued_input: Option<String>,
     status: String,
     status_since: Option<Instant>,
     footer_path: String,
@@ -437,9 +447,11 @@ struct TuiState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LineKind {
     Plain,
+    Assistant,
     User,
     System,
     Tool,
+    ToolTitle,
     Selection,
     Status,
     Hint,
@@ -469,6 +481,23 @@ impl StyledLine {
 struct RenderBlock {
     lines: Vec<StyledLine>,
     kind: BlockKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BottomSurface {
+    lines: Vec<StyledLine>,
+    cursor_row: usize,
+    cursor_col: usize,
+    live_rows: usize,
+    input_rows: usize,
+    info_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionSurface {
+    lines: Vec<StyledLine>,
+    selected_row: usize,
+    has_preview: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -597,7 +626,8 @@ impl TuiState {
             if !tool_lines.is_empty() {
                 lines.push(StyledLine::blank());
             }
-            let keep = tool_lines.len().saturating_sub(3);
+            let tool_budget = live_tool_tail_budget(max_lines);
+            let keep = tool_lines.len().saturating_sub(tool_budget);
             lines.extend(tool_lines.drain(keep..));
         }
 
@@ -685,6 +715,7 @@ impl TuiState {
         });
         self.live_assistant = None;
         self.live_tool = None;
+        self.queued_input = None;
     }
 
     fn push_message(&mut self, message: &AgentMessage) {
@@ -710,6 +741,7 @@ impl TuiState {
         self.committed_blocks.clear();
         self.live_assistant = None;
         self.live_tool = None;
+        self.queued_input = None;
         self.status_since = None;
         for message in messages {
             self.push_message(message);
@@ -722,13 +754,13 @@ impl TuiState {
             AgentEvent::MessageStart { role } => match role {
                 agent_model::LlmRole::Assistant => {
                     self.live_assistant = Some(RenderBlock {
-                        lines: vec![StyledLine::new("", LineKind::Plain)],
+                        lines: vec![StyledLine::new("", LineKind::Assistant)],
                         kind: BlockKind::Conversation,
                     });
                 }
                 agent_model::LlmRole::Tool => {
                     self.live_tool = Some(RenderBlock {
-                        lines: vec![StyledLine::new("· tool", LineKind::Tool)],
+                        lines: vec![StyledLine::new("· tool", LineKind::ToolTitle)],
                         kind: BlockKind::Tool,
                     });
                 }
@@ -739,7 +771,7 @@ impl TuiState {
                     append_text_to_block(block, "", &delta);
                 } else {
                     self.live_assistant = Some(RenderBlock {
-                        lines: vec![StyledLine::new(delta, LineKind::Plain)],
+                        lines: vec![StyledLine::new(delta, LineKind::Assistant)],
                         kind: BlockKind::Conversation,
                     });
                 }
@@ -748,7 +780,7 @@ impl TuiState {
                 self.live_tool = Some(RenderBlock {
                     lines: vec![StyledLine::new(
                         format!("· tool {name} ({id})"),
-                        LineKind::Tool,
+                        LineKind::ToolTitle,
                     )],
                     kind: BlockKind::Tool,
                 });
@@ -762,7 +794,7 @@ impl TuiState {
                 if let Some(block) = self.live_tool.as_mut() {
                     block
                         .lines
-                        .push(StyledLine::new(format!("  done {id}"), LineKind::Tool));
+                        .push(StyledLine::new(format!("  done {id}"), LineKind::ToolTitle));
                 }
             }
             AgentEvent::Usage(usage) => {
@@ -830,6 +862,7 @@ fn handle_running_key_state(state: &mut TuiState, key: KeyEvent) -> RunningActio
             if text.trim().is_empty() {
                 RunningAction::Continue
             } else {
+                state.queued_input = Some(text.clone());
                 RunningAction::QueueSubmit(text)
             }
         }
@@ -877,15 +910,15 @@ fn render_bottom_frame(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
     let width = area.width as usize;
     let height = area.height as usize;
-    let (lines, cursor_row, cursor_col) = bottom_lines(state, width, height);
+    let surface = bottom_surface(state, width, height);
 
     frame.render_widget(
-        Paragraph::new(Text::from(ratatui_lines(&lines, width))),
+        Paragraph::new(Text::from(ratatui_lines(&surface.lines, width))),
         area,
     );
     frame.set_cursor_position(Position::new(
-        area.x + cursor_col.min(width.saturating_sub(1)) as u16,
-        area.y + cursor_row.min(height.saturating_sub(1)) as u16,
+        area.x + surface.cursor_col.min(width.saturating_sub(1)) as u16,
+        area.y + surface.cursor_row.min(height.saturating_sub(1)) as u16,
     ));
 }
 
@@ -893,59 +926,48 @@ fn render_selection_frame(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
     let width = area.width as usize;
     let height = area.height as usize;
-    let mut lines = Vec::new();
-
-    let title = state.selection_title.as_deref().unwrap_or("Select");
-    lines.push(StyledLine::new(title, LineKind::Status));
-
-    let capacity = height.saturating_sub(2).max(1);
-    let max_scroll = state.selection_items.len().saturating_sub(capacity);
-    let start = state
-        .selection_index
-        .saturating_sub(capacity / 2)
-        .min(max_scroll);
-    let end = (start + capacity).min(state.selection_items.len());
-
-    for item_index in start..end {
-        let marker = if item_index == state.selection_index {
-            "›"
-        } else {
-            " "
-        };
-        let kind = if item_index == state.selection_index {
-            LineKind::Selection
-        } else {
-            LineKind::Plain
-        };
-        lines.push(StyledLine::new(
-            format!("{marker} {}", state.selection_items[item_index]),
-            kind,
-        ));
-    }
-
-    lines.push(StyledLine::new("Enter select · Esc cancel", LineKind::Hint));
-    while lines.len() < height {
-        lines.push(StyledLine::blank());
-    }
+    let surface = selection_surface(state, width, height);
 
     frame.render_widget(
-        Paragraph::new(Text::from(ratatui_lines(&lines, width))),
+        Paragraph::new(Text::from(ratatui_lines(&surface.lines, width))),
         area,
     );
     frame.set_cursor_position(Position::new(area.x, area.y));
 }
 
+#[cfg(test)]
 fn bottom_lines(state: &TuiState, width: usize, height: usize) -> (Vec<StyledLine>, usize, usize) {
+    let surface = bottom_surface(state, width, height);
+    (surface.lines, surface.cursor_row, surface.cursor_col)
+}
+
+fn bottom_surface(state: &TuiState, width: usize, height: usize) -> BottomSurface {
+    let width = width.max(1);
     let height = height.max(1);
     let info_line = state.info_line();
-    let info_rows = usize::from(!info_line.is_empty());
+    let info_rows = usize::from(!info_line.is_empty() && height >= 2);
+    let queued_lines = if height >= 3 {
+        queued_preview_lines(state, width)
+    } else {
+        Vec::new()
+    };
+    let queued_rows = queued_lines.len();
     let input_lines = render_input_lines(&state.input, width);
-    let max_input_rows = height.saturating_sub(info_rows).max(1);
-    let input_start = input_lines.len().saturating_sub(max_input_rows);
+    let live_active = state.live_assistant.is_some()
+        || state.live_tool.is_some()
+        || state.status.starts_with("Running");
+    let input_rows = visible_input_row_count(
+        input_lines.len(),
+        height,
+        info_rows + queued_rows,
+        live_active,
+    );
+    let input_start = input_lines.len().saturating_sub(input_rows);
     let visible_input = input_lines
         .iter()
         .enumerate()
         .skip(input_start)
+        .take(input_rows)
         .map(|(index, line)| {
             let prefix = if index == 0 {
                 INPUT_PREFIX
@@ -956,18 +978,24 @@ fn bottom_lines(state: &TuiState, width: usize, height: usize) -> (Vec<StyledLin
         })
         .collect::<Vec<_>>();
 
-    let occupied_tail_rows = visible_input.len() + info_rows;
-    let live_capacity = height.saturating_sub(occupied_tail_rows + 1);
-    let mut live_lines = state.render_live_lines(width, live_capacity);
-    let mut lines = Vec::new();
+    let tail_rows = visible_input.len() + queued_rows + info_rows;
+    let live_budget = height
+        .saturating_sub(tail_rows)
+        .saturating_sub(usize::from(tail_rows > 0));
+    let mut live_lines = state.render_live_lines(width, live_budget);
+    let has_live_separator =
+        !live_lines.is_empty() && tail_rows > 0 && live_lines.len() + tail_rows < height;
+    let live_rows = live_lines.len();
 
-    if !live_lines.is_empty() {
-        lines.append(&mut live_lines);
+    let mut lines = Vec::new();
+    lines.append(&mut live_lines);
+    if has_live_separator {
         lines.push(StyledLine::blank());
     }
+    lines.extend(queued_lines);
     let input_row_offset = lines.len();
     lines.extend(visible_input);
-    if !info_line.is_empty() && lines.len() < height {
+    if info_rows > 0 {
         lines.push(StyledLine::new(info_line, LineKind::Hint));
     }
 
@@ -988,7 +1016,205 @@ fn bottom_lines(state: &TuiState, width: usize, height: usize) -> (Vec<StyledLin
     );
     let row = input_row_offset + visible_cursor_row;
 
-    (lines, row, cursor_col)
+    BottomSurface {
+        lines,
+        cursor_row: row.min(height.saturating_sub(1)),
+        cursor_col,
+        live_rows,
+        input_rows,
+        info_rows,
+    }
+}
+
+fn selection_surface(state: &TuiState, width: usize, height: usize) -> SelectionSurface {
+    let width = width.max(1);
+    let height = height.max(1);
+    let title = state.selection_title.as_deref().unwrap_or("Select");
+    let footer_rows = usize::from(height >= 2);
+    let header_limit = height.saturating_sub(footer_rows + 1).clamp(1, 4);
+    let mut lines = selection_header_lines(title, width, header_limit);
+    let body_capacity = height.saturating_sub(lines.len() + footer_rows).max(1);
+    let has_preview = width >= SELECTION_PREVIEW_MIN_WIDTH && body_capacity >= 3;
+    let max_scroll = state.selection_items.len().saturating_sub(body_capacity);
+    let start = state
+        .selection_index
+        .saturating_sub(body_capacity / 2)
+        .min(max_scroll);
+    let end = (start + body_capacity).min(state.selection_items.len());
+    let selected_row = lines.len() + state.selection_index.saturating_sub(start);
+    let (left_width, preview_width) = selection_column_widths(width, has_preview);
+    let preview_lines = if has_preview {
+        selection_preview_lines(state, preview_width, body_capacity)
+    } else {
+        Vec::new()
+    };
+
+    for item_index in start..end {
+        let relative_row = item_index - start;
+        let marker = if item_index == state.selection_index {
+            "›"
+        } else {
+            " "
+        };
+        let kind = if item_index == state.selection_index {
+            LineKind::Selection
+        } else {
+            LineKind::Plain
+        };
+        let left = format!("{marker} {}", state.selection_items[item_index]);
+        let text = if has_preview {
+            let preview = preview_lines.get(relative_row).cloned().unwrap_or_default();
+            format!(
+                "{} │ {}",
+                pad_to_display_width(&truncate_to_display_width(&left, left_width), left_width),
+                truncate_to_display_width(&preview, preview_width)
+            )
+        } else {
+            left
+        };
+        lines.push(StyledLine::new(text, kind));
+    }
+
+    if footer_rows > 0 {
+        lines.push(StyledLine::new(
+            "Enter select · Esc cancel · ↑/↓ move",
+            LineKind::Hint,
+        ));
+    }
+    while lines.len() < height {
+        lines.push(StyledLine::blank());
+    }
+
+    if lines.len() > height {
+        lines.truncate(height);
+    }
+
+    SelectionSurface {
+        lines,
+        selected_row: selected_row.min(height.saturating_sub(1)),
+        has_preview,
+    }
+}
+
+fn visible_input_row_count(
+    rendered_input_rows: usize,
+    height: usize,
+    reserved_rows: usize,
+    live_active: bool,
+) -> usize {
+    let remaining = height.saturating_sub(reserved_rows).max(1);
+    let input_limit = if live_active {
+        (height / 3).clamp(1, 5)
+    } else {
+        remaining
+    };
+    rendered_input_rows.max(1).min(remaining).min(input_limit)
+}
+
+fn queued_preview_lines(state: &TuiState, width: usize) -> Vec<StyledLine> {
+    let Some(input) = state.queued_input.as_deref() else {
+        return Vec::new();
+    };
+    if input.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let prefix = "Queued next: ";
+    let preview_width = width.saturating_sub(display_width(prefix)).max(1);
+    vec![StyledLine::new(
+        format!("{prefix}{}", one_line_preview(input, preview_width)),
+        LineKind::Status,
+    )]
+}
+
+fn one_line_preview(text: &str, width: usize) -> String {
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let compact = if compact.is_empty() {
+        text.trim()
+    } else {
+        &compact
+    };
+    truncate_to_display_width(compact, width)
+}
+
+fn selection_header_lines(title: &str, width: usize, max_rows: usize) -> Vec<StyledLine> {
+    let mut lines = Vec::new();
+    for raw_line in title.lines() {
+        let raw_line = raw_line.trim();
+        if raw_line.is_empty() {
+            continue;
+        }
+
+        for segment in wrap_line_by_display_width(raw_line, width) {
+            let kind = if lines.is_empty() {
+                LineKind::Status
+            } else {
+                LineKind::Hint
+            };
+            lines.push(StyledLine::new(segment, kind));
+            if lines.len() >= max_rows {
+                return lines;
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(StyledLine::new("Select", LineKind::Status));
+    }
+    lines
+}
+
+fn selection_column_widths(width: usize, has_preview: bool) -> (usize, usize) {
+    if !has_preview {
+        return (width, 0);
+    }
+
+    let preview_width = (width / 3).clamp(24, 38).min(width.saturating_sub(36));
+    let left_width = width.saturating_sub(preview_width + 3).max(1);
+    (left_width, preview_width)
+}
+
+fn selection_preview_lines(state: &TuiState, width: usize, max_rows: usize) -> Vec<String> {
+    let mut raw_lines = Vec::new();
+    raw_lines.push(format!(
+        "Selected {}/{}",
+        state.selection_index + 1,
+        state.selection_items.len()
+    ));
+    if let Some(item) = state.selection_items.get(state.selection_index) {
+        raw_lines.push(item.clone());
+    }
+    if let Some(title) = state.selection_title.as_deref() {
+        raw_lines.extend(
+            title
+                .lines()
+                .skip(1)
+                .take(2)
+                .map(|line| line.trim().to_string()),
+        );
+    }
+
+    let mut lines = Vec::new();
+    for raw_line in raw_lines {
+        if raw_line.is_empty() {
+            continue;
+        }
+        lines.extend(wrap_line_by_display_width(&raw_line, width));
+        if lines.len() >= max_rows {
+            break;
+        }
+    }
+    lines.truncate(max_rows);
+    lines
+}
+
+fn live_tool_tail_budget(max_lines: usize) -> usize {
+    max_lines.saturating_sub(1).max(1).min(6)
 }
 
 fn ratatui_lines(lines: &[StyledLine], width: usize) -> Vec<Line<'static>> {
@@ -1007,13 +1233,16 @@ fn ratatui_lines(lines: &[StyledLine], width: usize) -> Vec<Line<'static>> {
 
 fn style_for_kind(kind: LineKind) -> Style {
     match kind {
-        LineKind::Plain | LineKind::Input => Style::default(),
-        LineKind::User => Style::default().fg(Color::White).bg(Color::Rgb(54, 58, 64)),
+        LineKind::Plain | LineKind::Assistant | LineKind::Input => Style::default(),
+        LineKind::User => Style::default().fg(Color::White).bg(Color::Rgb(42, 46, 51)),
         LineKind::System => Style::default().fg(Color::DarkGray),
-        LineKind::Tool => Style::default().fg(Color::Cyan),
+        LineKind::Tool => Style::default().fg(Color::DarkGray),
+        LineKind::ToolTitle => Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
         LineKind::Selection => Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(78, 82, 88))
+            .bg(Color::Rgb(67, 72, 78))
             .add_modifier(Modifier::BOLD),
         LineKind::Status => Style::default().fg(Color::Gray),
         LineKind::Hint => Style::default().fg(Color::DarkGray),
@@ -1058,6 +1287,20 @@ fn clip_to_width(text: &str, width: usize) -> String {
             break;
         }
     }
+    clipped
+}
+
+fn truncate_to_display_width(text: &str, width: usize) -> String {
+    let width = width.max(1);
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    if width <= 3 {
+        return clip_to_width(text, width);
+    }
+
+    let mut clipped = clip_to_width(text, width - 3);
+    clipped.push_str("...");
     clipped
 }
 
@@ -1120,8 +1363,25 @@ fn should_handle_key_event(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-fn selection_page_size() -> usize {
-    INLINE_VIEWPORT_HEIGHT.saturating_sub(3).max(1) as usize
+fn initial_viewport_size() -> (u16, u16) {
+    crossterm::terminal::size()
+        .map(|(columns, rows)| (columns, inline_viewport_height_for_rows(rows)))
+        .unwrap_or((0, DEFAULT_INLINE_VIEWPORT_HEIGHT))
+}
+
+fn inline_viewport_height_for_rows(rows: u16) -> u16 {
+    rows.saturating_mul(3)
+        .saturating_div(5)
+        .clamp(MIN_INLINE_VIEWPORT_HEIGHT, MAX_INLINE_VIEWPORT_HEIGHT)
+}
+
+fn selection_page_size(viewport_height: u16) -> usize {
+    let height = if viewport_height == 0 {
+        DEFAULT_INLINE_VIEWPORT_HEIGHT
+    } else {
+        viewport_height
+    };
+    height.saturating_sub(3).max(1) as usize
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -1245,6 +1505,63 @@ mod tests {
     }
 
     #[test]
+    fn assistant_messages_use_body_line_kind() {
+        let message = AgentMessage::Assistant(agent_model::LlmMessage {
+            role: agent_model::LlmRole::Assistant,
+            parts: vec![agent_model::MessagePart::Text(agent_model::TextPart {
+                text: "readable answer".to_string(),
+            })],
+        });
+
+        let lines = format_message(&message);
+        assert_eq!(lines[0].kind, LineKind::Assistant);
+        assert_eq!(lines[0].text, "readable answer");
+    }
+
+    #[test]
+    fn long_tool_outputs_are_compacted_around_the_tail() {
+        let content = (1..=12)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = AgentMessage::ToolResult(agent_model::LlmMessage {
+            role: agent_model::LlmRole::Tool,
+            parts: vec![agent_model::MessagePart::ToolResult(
+                agent_model::ToolResultPart {
+                    call_id: "call-1".to_string(),
+                    content,
+                    is_error: false,
+                },
+            )],
+        });
+
+        let texts = format_message(&message)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts[0], "· tool result call-1");
+        assert!(texts.contains(&"  ... 4 earlier lines omitted".to_string()));
+        assert!(!texts.contains(&"  line 1".to_string()));
+        assert!(texts.contains(&"  line 12".to_string()));
+    }
+
+    #[test]
+    fn live_tool_args_do_not_merge_into_the_tool_title() {
+        let mut block = RenderBlock {
+            lines: vec![StyledLine::new("· tool bash (call-1)", LineKind::ToolTitle)],
+            kind: BlockKind::Tool,
+        };
+
+        append_text_to_block(&mut block, "  ", "{\"cmd\":\"ls\"}");
+
+        assert_eq!(block.lines[0].text, "· tool bash (call-1)");
+        assert_eq!(block.lines[0].kind, LineKind::ToolTitle);
+        assert_eq!(block.lines[1].text, "  {\"cmd\":\"ls\"}");
+        assert_eq!(block.lines[1].kind, LineKind::Tool);
+    }
+
+    #[test]
     fn input_wrapping_uses_display_width_for_wide_characters() {
         let lines = render_input_lines("안녕하세요", 8);
         assert_eq!(lines, vec!["안녕하".to_string(), "세요".to_string()]);
@@ -1274,6 +1591,22 @@ mod tests {
     }
 
     #[test]
+    fn inline_viewport_height_tracks_terminal_rows_with_bounds() {
+        assert_eq!(
+            inline_viewport_height_for_rows(12),
+            MIN_INLINE_VIEWPORT_HEIGHT
+        );
+        assert_eq!(
+            inline_viewport_height_for_rows(24),
+            DEFAULT_INLINE_VIEWPORT_HEIGHT
+        );
+        assert_eq!(
+            inline_viewport_height_for_rows(80),
+            MAX_INLINE_VIEWPORT_HEIGHT
+        );
+    }
+
+    #[test]
     fn user_messages_use_distinct_line_kind() {
         let message = AgentMessage::User(agent_model::LlmMessage {
             role: agent_model::LlmRole::User,
@@ -1285,6 +1618,28 @@ mod tests {
         let lines = format_message(&message);
         assert_eq!(lines[0].kind, LineKind::User);
         assert_eq!(lines[0].text, "▌  hello");
+    }
+
+    #[test]
+    fn running_enter_stores_queued_prompt_preview() {
+        let mut state = TuiState {
+            input: "next\nprompt".to_string(),
+            cursor: "next\nprompt".chars().count(),
+            ..Default::default()
+        };
+
+        let action = handle_running_key_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(action, RunningAction::QueueSubmit(text) if text == "next\nprompt"));
+        assert_eq!(state.queued_input.as_deref(), Some("next\nprompt"));
+        let surface = bottom_surface(&state, 40, 5);
+        assert!(surface
+            .lines
+            .iter()
+            .any(|line| line.text == "Queued next: next / prompt"));
     }
 
     #[test]
@@ -1330,6 +1685,124 @@ mod tests {
         assert!(texts.contains(&"four"));
         assert!(texts.contains(&"five"));
         assert!(!texts.contains(&"Reply preview"));
+    }
+
+    #[test]
+    fn bottom_surface_keeps_live_tail_visible_when_input_wraps() {
+        let mut state = TuiState {
+            input: "first line\nsecond line\nthird line\nfourth line".to_string(),
+            cursor: "first line\nsecond line\nthird line\nfourth line"
+                .chars()
+                .count(),
+            ..Default::default()
+        };
+        state.set_status("Running");
+        state.apply_event(AgentEvent::MessageStart {
+            role: agent_model::LlmRole::Assistant,
+        });
+        state.apply_event(AgentEvent::TextDelta(
+            "one\ntwo\nthree\nfour\nfive".to_string(),
+        ));
+
+        let surface = bottom_surface(&state, 40, 8);
+        let texts = surface
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(surface.live_rows > 0);
+        assert!(surface.input_rows <= 2);
+        assert!(texts.contains(&"five"));
+        assert!(texts
+            .iter()
+            .any(|line| line.starts_with("> ") || line.starts_with("  ")));
+    }
+
+    #[test]
+    fn test_backend_keeps_live_output_above_prompt_and_footer() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = TuiState {
+            input: "queued?".to_string(),
+            cursor: 7,
+            ..Default::default()
+        };
+        state.set_status("Running");
+        state.apply_event(AgentEvent::MessageStart {
+            role: agent_model::LlmRole::Assistant,
+        });
+        state.apply_event(AgentEvent::TextDelta("alpha\nbeta\ngamma".to_string()));
+
+        let backend = TestBackend::new(72, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_frame(frame, &state)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        let prompt_row = lines
+            .iter()
+            .position(|line| line.starts_with("> queued?"))
+            .unwrap();
+        let gamma_row = lines
+            .iter()
+            .position(|line| line.trim() == "gamma")
+            .unwrap();
+
+        assert!(gamma_row < prompt_row);
+        assert!(prompt_row < lines.len() - 1);
+        assert!(lines.last().unwrap().contains("usage n/a"));
+    }
+
+    #[test]
+    fn selection_surface_shows_preview_for_wide_viewports() {
+        let state = TuiState {
+            selection_title: Some("Select session (= match, ! mismatch, ? unknown)".to_string()),
+            selection_items: vec![
+                "= 26-05-22 10:00 openai/gpt session-a".to_string(),
+                "! 26-05-22 11:00 anthropic/claude session-b".to_string(),
+            ],
+            selection_index: 1,
+            ..Default::default()
+        };
+
+        let surface = selection_surface(&state, 90, 8);
+        let texts = surface
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(surface.has_preview);
+        assert!(texts.iter().any(|line| line.contains("│ Selected 2/2")));
+        assert!(texts[surface.selected_row].contains("session-b"));
+    }
+
+    #[test]
+    fn selection_surface_keeps_mismatch_details_readable() {
+        let state = TuiState {
+            selection_title: Some(
+                "Session provider differs\nruntime=openai/gpt-4.1\nsession=anthropic/claude\nmodel: runtime=gpt-4.1 session=claude".to_string(),
+            ),
+            selection_items: vec![
+                "Fork with current provider (openai) [recommended]".to_string(),
+                "Open existing session as-is [advanced]".to_string(),
+                "Cancel".to_string(),
+            ],
+            selection_index: 0,
+            ..Default::default()
+        };
+
+        let surface = selection_surface(&state, 82, 9);
+        let texts = surface
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts[0], "Session provider differs");
+        assert!(texts
+            .iter()
+            .any(|line| line.contains("runtime=openai/gpt-4.1")));
+        assert!(texts[surface.selected_row].contains("Fork with current provider"));
     }
 
     #[test]
@@ -1382,5 +1855,17 @@ mod tests {
 
     fn block_texts(block: &RenderBlock) -> Vec<String> {
         block.lines.iter().map(|line| line.text.clone()).collect()
+    }
+
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (buffer.area.y..buffer.area.y + buffer.area.height)
+            .map(|y| {
+                (buffer.area.x..buffer.area.x + buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 }
