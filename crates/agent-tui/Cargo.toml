@@ -9,5 +9,6 @@ agent-model = { path = "../agent-model" }
 agent-core = { path = "../agent-core" }
 anyhow.workspace = true
 crossterm.workspace = true
+ratatui.workspace = true
 time.workspace = true
 unicode-width.workspace = true
