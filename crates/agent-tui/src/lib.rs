@@ -1,57 +1,102 @@
-use std::io::{Stdout, Write, stdout};
+use std::io::{stdout, Stdout};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use agent_core::{AgentEvent, AgentMessage};
 use agent_model::Usage;
-use crossterm::cursor::{MoveTo, Show};
+use anyhow::Context;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
-use crossterm::{execute, queue};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Position;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Widget};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use time::OffsetDateTime;
 use time::UtcOffset;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use agent_core::{AgentEvent, AgentMessage};
 use bottom_pane::{cursor_position_for_input, render_input_lines, wrap_line_by_display_width};
-use conversation::{append_text_to_block, classify_block_from_message, format_message, message_lines};
+use conversation::{
+    append_text_to_block, classify_block_from_message, format_message, message_lines,
+};
 
 mod bottom_pane;
 mod conversation;
 
+const INLINE_VIEWPORT_HEIGHT: u16 = 12;
 const INPUT_PREFIX: &str = "> ";
 const INPUT_CONTINUATION_PREFIX: &str = "  ";
 const INPUT_PREFIX_WIDTH: usize = 2;
-
 const USER_PREFIX: &str = "▌  ";
 
+type RatTerminal = Terminal<CrosstermBackend<Stdout>>;
+
 pub struct TuiApp {
-    terminal: Terminal,
+    terminal: RatTerminal,
     state: TuiState,
-    last_frame: Vec<StyledLine>,
+    printed_committed_blocks: usize,
+    entered: bool,
 }
 
 impl TuiApp {
     pub fn new() -> anyhow::Result<Self> {
+        let backend = CrosstermBackend::new(stdout());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+            },
+        )?;
+
         Ok(Self {
-            terminal: Terminal::new(),
+            terminal,
             state: TuiState::default(),
-            last_frame: Vec::new(),
+            printed_committed_blocks: 0,
+            entered: false,
         })
     }
 
     pub fn enter(&mut self) -> anyhow::Result<()> {
-        self.terminal.enter()?;
-        self.last_frame.clear();
+        if self.entered {
+            return Ok(());
+        }
+
+        enable_raw_mode().context("failed to enable raw mode")?;
+        execute!(
+            std::io::stdout(),
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )
+        .ok();
+        self.entered = true;
         self.render()
     }
 
     pub fn leave(&mut self) -> anyhow::Result<()> {
-        self.terminal.leave()
+        if !self.entered {
+            return Ok(());
+        }
+
+        self.terminal.show_cursor().ok();
+        execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags
+        )
+        .ok();
+        disable_raw_mode().context("failed to disable raw mode")?;
+        self.entered = false;
+        Ok(())
     }
 
     pub fn push_event(&mut self, event: AgentEvent) {
@@ -72,6 +117,7 @@ impl TuiApp {
 
     pub fn replace_messages(&mut self, messages: &[AgentMessage]) {
         self.state.replace_messages(messages);
+        self.printed_committed_blocks = 0;
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -115,9 +161,13 @@ impl TuiApp {
         items: &[String],
         initial_index: usize,
     ) -> anyhow::Result<Option<usize>> {
+        if items.is_empty() {
+            return Ok(None);
+        }
+
         self.state.selection_title = Some(title.into());
         self.state.selection_items = items.to_vec();
-        self.state.selection_index = initial_index.min(self.state.selection_items.len().saturating_sub(1));
+        self.state.selection_index = initial_index.min(items.len().saturating_sub(1));
 
         loop {
             self.render()?;
@@ -125,20 +175,18 @@ impl TuiApp {
                 continue;
             }
 
-        match event::read().context("failed to read terminal event")? {
-            Event::Key(key) if should_handle_key_event(key) => match key.code {
-                KeyCode::Esc => {
-                    self.state.selection_title = None;
-                    self.state.selection_items.clear();
-                    return Ok(None);
+            match event::read().context("failed to read terminal event")? {
+                Event::Key(key) if should_handle_key_event(key) => match key.code {
+                    KeyCode::Esc => {
+                        self.clear_selection();
+                        return Ok(None);
                     }
                     KeyCode::Enter => {
                         let index = self
                             .state
                             .selection_index
                             .min(self.state.selection_items.len().saturating_sub(1));
-                        self.state.selection_title = None;
-                        self.state.selection_items.clear();
+                        self.clear_selection();
                         return Ok(Some(index));
                     }
                     KeyCode::Up => {
@@ -148,12 +196,22 @@ impl TuiApp {
                         let max = self.state.selection_items.len().saturating_sub(1);
                         self.state.selection_index = (self.state.selection_index + 1).min(max);
                     }
+                    KeyCode::PageUp => {
+                        self.state.selection_index = self
+                            .state
+                            .selection_index
+                            .saturating_sub(selection_page_size());
+                    }
+                    KeyCode::PageDown => {
+                        let max = self.state.selection_items.len().saturating_sub(1);
+                        self.state.selection_index =
+                            (self.state.selection_index + selection_page_size()).min(max);
+                    }
                     _ => {}
                 },
-            Event::Key(_) => {}
-            Event::Mouse(mouse) => self.handle_mouse_in_selection(mouse),
-            Event::Resize(width, height) => {
-                self.state.viewport_width = width;
+                Event::Mouse(mouse) => self.handle_mouse_in_selection(mouse),
+                Event::Resize(width, height) => {
+                    self.state.viewport_width = width;
                     self.state.viewport_height = height;
                 }
                 _ => {}
@@ -169,7 +227,6 @@ impl TuiApp {
 
         match event::read().context("failed to read terminal event")? {
             Event::Key(key) if should_handle_key_event(key) => Ok(self.handle_running_key(key)),
-            Event::Key(_) => Ok(RunningAction::Continue),
             Event::Paste(text) => {
                 self.state.insert_text(&text);
                 Ok(RunningAction::Continue)
@@ -187,7 +244,10 @@ impl TuiApp {
         }
     }
 
-    pub fn poll_prompt_action(&mut self, timeout: Duration) -> anyhow::Result<Option<PromptAction>> {
+    pub fn poll_prompt_action(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<PromptAction>> {
         self.render()?;
         if !event::poll(timeout).context("failed to poll terminal events")? {
             return Ok(None);
@@ -195,7 +255,6 @@ impl TuiApp {
 
         match event::read().context("failed to read terminal event")? {
             Event::Key(key) if should_handle_key_event(key) => Ok(self.handle_key(key)),
-            Event::Key(_) => Ok(Some(PromptAction::Continue)),
             Event::Paste(text) => {
                 self.state.insert_text(&text);
                 Ok(Some(PromptAction::Continue))
@@ -213,9 +272,17 @@ impl TuiApp {
         }
     }
 
+    fn clear_selection(&mut self) {
+        self.state.selection_title = None;
+        self.state.selection_items.clear();
+        self.state.selection_index = 0;
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Option<PromptAction> {
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(PromptAction::Quit),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(PromptAction::Quit)
+            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.insert_char('\n');
                 Some(PromptAction::Continue)
@@ -261,27 +328,11 @@ impl TuiApp {
                 Some(PromptAction::Continue)
             }
             KeyCode::Up => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.state.scroll_up(1);
-                } else {
-                    self.state.move_vertical(-1);
-                }
+                self.state.move_vertical(-1);
                 Some(PromptAction::Continue)
             }
             KeyCode::Down => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.state.scroll_down(1);
-                } else {
-                    self.state.move_vertical(1);
-                }
-                Some(PromptAction::Continue)
-            }
-            KeyCode::PageUp => {
-                self.state.scroll_up(self.state.page_scroll_amount());
-                Some(PromptAction::Continue)
-            }
-            KeyCode::PageDown => {
-                self.state.scroll_down(self.state.page_scroll_amount());
+                self.state.move_vertical(1);
                 Some(PromptAction::Continue)
             }
             KeyCode::Char(ch) => {
@@ -293,84 +344,10 @@ impl TuiApp {
     }
 
     fn handle_running_key(&mut self, key: KeyEvent) -> RunningAction {
-        match key.code {
-            KeyCode::Esc => RunningAction::Abort,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => RunningAction::Quit,
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.insert_char('\n');
-                RunningAction::Continue
-            }
-            KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.state.insert_char('\n');
-                RunningAction::Continue
-            }
-            KeyCode::Enter => {
-                let text = std::mem::take(&mut self.state.input);
-                self.state.cursor = 0;
-                if text.trim().is_empty() {
-                    RunningAction::Continue
-                } else {
-                    RunningAction::QueueSubmit(text)
-                }
-            }
-            KeyCode::Backspace => {
-                self.state.backspace();
-                RunningAction::Continue
-            }
-            KeyCode::Delete => {
-                self.state.delete();
-                RunningAction::Continue
-            }
-            KeyCode::Left => {
-                self.state.move_left();
-                RunningAction::Continue
-            }
-            KeyCode::Right => {
-                self.state.move_right();
-                RunningAction::Continue
-            }
-            KeyCode::Home => {
-                self.state.move_to_line_start();
-                RunningAction::Continue
-            }
-            KeyCode::End => {
-                self.state.move_to_line_end();
-                RunningAction::Continue
-            }
-            KeyCode::Up => {
-                self.state.scroll_up(1);
-                RunningAction::Continue
-            }
-            KeyCode::Down => {
-                self.state.scroll_down(1);
-                RunningAction::Continue
-            }
-            KeyCode::PageUp => {
-                self.state.scroll_up(self.state.page_scroll_amount());
-                RunningAction::Continue
-            }
-            KeyCode::PageDown => {
-                self.state.scroll_down(self.state.page_scroll_amount());
-                RunningAction::Continue
-            }
-            KeyCode::Char(ch) => {
-                self.state.insert_char(ch);
-                RunningAction::Continue
-            }
-            _ => RunningAction::Continue,
-        }
+        handle_running_key_state(&mut self.state, key)
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.state.scroll_up(3),
-            MouseEventKind::ScrollDown => self.state.scroll_down(3),
-            _ => {}
-        }
-    }
+    fn handle_mouse(&mut self, _mouse: MouseEvent) {}
 
     fn handle_mouse_in_selection(&mut self, mouse: MouseEvent) {
         match mouse.kind {
@@ -381,143 +358,68 @@ impl TuiApp {
                 let max = self.state.selection_items.len().saturating_sub(1);
                 self.state.selection_index = (self.state.selection_index + 1).min(max);
             }
-            _ => self.handle_mouse(mouse),
+            _ => {}
         }
     }
 
     fn render(&mut self) -> anyhow::Result<()> {
-        let (width, height) = terminal::size().context("failed to get terminal size")?;
-        self.state.viewport_width = width;
-        self.state.viewport_height = height;
-
-        let raw_lines = self.state.render_lines();
-        let wrapped_lines = wrap_lines(&raw_lines, width as usize);
-
-        let input_lines = render_input_lines(&self.state.input, width as usize);
-        let editor_height = input_lines.len().max(1) as u16;
-        let hint_rows = 1u16;
-        let bottom_divider_row = height.saturating_sub(hint_rows + 1);
-        let input_start_row = bottom_divider_row.saturating_sub(editor_height);
-        let top_divider_row = input_start_row.saturating_sub(1);
-        let status_text = self.state.status_line();
-        let status_row = if !status_text.is_empty() && top_divider_row > 1 {
-            Some(top_divider_row - 2)
-        } else if !status_text.is_empty() && top_divider_row > 0 {
-            Some(top_divider_row - 1)
-        } else {
-            None
-        };
-        let hint_row = bottom_divider_row.saturating_add(1);
-        let log_height = status_row.unwrap_or(top_divider_row) as usize;
-        self.state.update_rendered_lines(wrapped_lines, log_height);
-        let visible_lines = self.state.visible_log_lines();
-
-        let mut frame = vec![StyledLine::blank(); height as usize];
-        for (index, line) in visible_lines.iter().enumerate() {
-            frame[index] = line.with_text(clip_to_width(&line.text, width as usize));
+        if !self.entered {
+            return Ok(());
         }
 
-        let hint_text = self.state.hint_line();
-        if let Some(status_row) = status_row {
-            if status_row < height {
-                frame[status_row as usize] =
-                    StyledLine::new(clip_to_width(&status_text, width as usize), LineKind::Status);
-            }
-        }
-        if top_divider_row < height {
-            frame[top_divider_row as usize] =
-                StyledLine::new("─".repeat(width as usize), LineKind::Divider);
-        }
-        if bottom_divider_row < height {
-            frame[bottom_divider_row as usize] =
-                StyledLine::new("─".repeat(width as usize), LineKind::Divider);
-        }
-        if hint_row < height {
-            frame[hint_row as usize] =
-                StyledLine::new(clip_to_width(&hint_text, width as usize), LineKind::Hint);
-        }
-
-        for (offset, line) in input_lines.iter().enumerate() {
-            let row = input_start_row as usize + offset;
-            if row < frame.len() {
-                let prefix = if offset == 0 {
-                    INPUT_PREFIX
-                } else {
-                    INPUT_CONTINUATION_PREFIX
-                };
-                frame[row] = StyledLine::new(
-                    clip_to_width(&format!("{prefix}{line}"), width as usize),
-                    LineKind::Input,
-                );
-            }
-        }
-
-        if !self.state.selection_items.is_empty() {
-            overlay_selection(
-                &mut frame,
-                width as usize,
-                height as usize,
-                self.state.selection_title.as_deref().unwrap_or("Select"),
-                &self.state.selection_items,
-                self.state.selection_index,
-            );
-        }
-
-        let (cursor_row, cursor_col) = cursor_position_for_input(
-            &self.state.input,
-            self.state.cursor,
-            self.state.viewport_width as usize,
-            input_start_row,
-        );
-        self.draw_frame(&frame, cursor_row, cursor_col)?;
-        self.terminal.stdout.flush()?;
+        self.flush_committed_blocks()?;
+        let state = &self.state;
+        self.terminal.draw(|frame| render_frame(frame, state))?;
         Ok(())
     }
 
-    fn draw_frame(
-        &mut self,
-        frame: &[StyledLine],
-        cursor_row: u16,
-        cursor_col: usize,
-    ) -> anyhow::Result<()> {
-        if self.last_frame.len() != frame.len() {
-            queue!(self.terminal.stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-            self.last_frame = vec![StyledLine::blank(); frame.len()];
+    fn flush_committed_blocks(&mut self) -> anyhow::Result<()> {
+        if self.printed_committed_blocks >= self.state.committed_blocks.len() {
+            return Ok(());
         }
 
-        for (row, line) in frame.iter().enumerate() {
-            let changed = self
-                .last_frame
-                .get(row)
-                .map(|prev| prev != line)
-                .unwrap_or(true);
-            if changed {
-                let clipped = clip_to_width(&line.text, self.state.viewport_width as usize);
-                let trailing_spaces = " ".repeat(
-                    self.state
-                        .viewport_width
-                        .saturating_sub(display_width(&clipped) as u16) as usize,
-                );
-                queue!(self.terminal.stdout, MoveTo(0, row as u16))?;
-                apply_style(&mut self.terminal.stdout, line.kind)?;
-                queue!(
-                    self.terminal.stdout,
-                    Print(&clipped),
-                    ResetColor,
-                    Print(trailing_spaces)
-                )?;
-            }
+        let size = self.terminal.size()?;
+        let width = size.width as usize;
+        let lines = self
+            .state
+            .render_committed_lines_from(width, self.printed_committed_blocks);
+
+        for chunk in lines.chunks(u16::MAX as usize) {
+            self.terminal.insert_before(chunk.len() as u16, |buf| {
+                Paragraph::new(Text::from(ratatui_lines(chunk, buf.area.width as usize)))
+                    .render(buf.area, buf);
+            })?;
         }
 
-        queue!(self.terminal.stdout, Show, MoveTo(cursor_col as u16, cursor_row))?;
-        self.last_frame = frame.to_vec();
+        self.printed_committed_blocks = self.state.committed_blocks.len();
         Ok(())
     }
 }
 
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        let _ = self.leave();
+    }
+}
+
+pub enum PromptAction {
+    Submit(String),
+    Quit,
+    Continue,
+}
+
+pub enum RunningAction {
+    Abort,
+    Quit,
+    Continue,
+    QueueSubmit(String),
+}
+
 #[derive(Default)]
 struct TuiState {
-    blocks: Vec<RenderBlock>,
+    committed_blocks: Vec<RenderBlock>,
+    live_assistant: Option<RenderBlock>,
+    live_tool: Option<RenderBlock>,
     input: String,
     cursor: usize,
     status: String,
@@ -527,14 +429,6 @@ struct TuiState {
     latest_usage: Option<Usage>,
     viewport_width: u16,
     viewport_height: u16,
-    active_assistant: Option<usize>,
-    active_tool: Option<usize>,
-    scroll_top: usize,
-    follow_output: bool,
-    unseen_output_lines: usize,
-    rendered_lines: Vec<StyledLine>,
-    rendered_log_height: usize,
-    frozen_lines: Option<Vec<StyledLine>>,
     selection_title: Option<String>,
     selection_items: Vec<String>,
     selection_index: usize,
@@ -547,7 +441,6 @@ enum LineKind {
     System,
     Tool,
     Selection,
-    Divider,
     Status,
     Hint,
     Input,
@@ -569,274 +462,6 @@ impl StyledLine {
 
     fn blank() -> Self {
         Self::new("", LineKind::Plain)
-    }
-
-    fn with_text(&self, text: impl Into<String>) -> Self {
-        Self::new(text, self.kind)
-    }
-}
-
-pub enum PromptAction {
-    Submit(String),
-    Quit,
-    Continue,
-}
-
-pub enum RunningAction {
-    Abort,
-    Quit,
-    Continue,
-    QueueSubmit(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn running_keys_map_to_abort_and_quit_actions() {
-        let mut app = TuiApp::new().unwrap();
-
-        let abort = app.handle_running_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(abort, RunningAction::Abort));
-
-        let quit = app.handle_running_key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-        ));
-        assert!(matches!(quit, RunningAction::Quit));
-
-        let cont = app.handle_running_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert!(matches!(cont, RunningAction::Continue));
-    }
-
-    #[test]
-    fn prompt_reset_keeps_existing_status() {
-        let mut app = TuiApp::new().unwrap();
-        app.set_status("Provider mismatch, /fork recommended");
-        app.state.input = "pending".to_string();
-        app.state.cursor = 7;
-
-        app.state.input.clear();
-        app.state.cursor = 0;
-
-        assert_eq!(app.state.status, "Provider mismatch, /fork recommended");
-        assert!(app.state.input.is_empty());
-        assert_eq!(app.state.cursor, 0);
-    }
-
-    #[test]
-    fn system_notes_split_multiline_text_into_lines() {
-        let mut app = TuiApp::new().unwrap();
-        app.push_system_note("first line\nsecond line");
-
-        assert_eq!(
-            block_texts(app.state.blocks.last().unwrap()),
-            vec![
-                "· first line".to_string(),
-                "· second line".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn format_message_splits_multiline_tool_output() {
-        let message = AgentMessage::ToolResult(agent_model::LlmMessage {
-            role: agent_model::LlmRole::Tool,
-            parts: vec![agent_model::MessagePart::ToolResult(agent_model::ToolResultPart {
-                call_id: "call-1".to_string(),
-                content: "line one\nline two".to_string(),
-                is_error: false,
-            })],
-        });
-
-        assert_eq!(
-            format_message(&message)
-                .into_iter()
-                .map(|line| line.text)
-                .collect::<Vec<_>>(),
-            vec![
-                "· tool result call-1".to_string(),
-                "  line one".to_string(),
-                "  line two".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn input_wrapping_uses_display_width_for_wide_characters() {
-        let lines = render_input_lines("안녕하세요", 8);
-        assert_eq!(
-            lines,
-            vec!["안녕하".to_string(), "세요".to_string()]
-        );
-    }
-
-    #[test]
-    fn insert_text_preserves_multiline_paste() {
-        let mut state = TuiState::default();
-        state.insert_text("first\nsecond");
-
-        assert_eq!(state.input, "first\nsecond");
-        assert_eq!(state.cursor, "first\nsecond".chars().count());
-    }
-
-    #[test]
-    fn cursor_position_accounts_for_wider_input_prefix() {
-        let (row, col) = cursor_position_for_input("hello", 5, 20, 6);
-        assert_eq!(row, 6);
-        assert_eq!(col, INPUT_PREFIX_WIDTH + 5);
-    }
-
-    #[test]
-    fn scrolling_up_stops_following_output() {
-        let mut state = TuiState {
-            follow_output: true,
-            rendered_lines: (0..10)
-                .map(|idx| StyledLine::new(format!("line {idx}"), LineKind::Plain))
-                .collect(),
-            rendered_log_height: 4,
-            ..Default::default()
-        };
-
-        state.scroll_up(3);
-        state.push_system_note("new output");
-
-        assert_eq!(state.scroll_top, 3);
-        assert!(!state.follow_output);
-        assert_eq!(state.unseen_output_lines, 0);
-        assert_eq!(state.frozen_lines.as_ref().unwrap().len(), 10);
-    }
-
-    #[test]
-    fn visible_log_lines_stay_anchored_when_not_following_output() {
-        let state = TuiState {
-            scroll_top: 2,
-            follow_output: false,
-            rendered_log_height: 3,
-            frozen_lines: Some(
-                (0..10)
-                    .map(|idx| StyledLine::new(format!("line {idx}"), LineKind::Plain))
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-
-        let visible = state.visible_log_lines();
-        let texts = visible.iter().map(|line| line.text.as_str()).collect::<Vec<_>>();
-        assert_eq!(texts, vec!["line 2", "line 3", "line 4"]);
-    }
-
-    #[test]
-    fn token_count_is_compactly_formatted() {
-        assert_eq!(format_token_count(999), "999");
-        assert_eq!(format_token_count(1_500), "1.5k");
-        assert_eq!(format_token_count(2_500_000), "2.5m");
-    }
-
-    #[test]
-    fn sync_scroll_tracks_unseen_output_when_viewport_is_frozen() {
-        let mut state = TuiState {
-            scroll_top: 2,
-            follow_output: false,
-            rendered_log_height: 3,
-            rendered_lines: (0..5)
-                .map(|idx| StyledLine::new(format!("line {idx}"), LineKind::Plain))
-                .collect(),
-            frozen_lines: Some(
-                (0..5)
-                    .map(|idx| StyledLine::new(format!("line {idx}"), LineKind::Plain))
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-
-        state.update_rendered_lines(
-            (0..7)
-                .map(|idx| StyledLine::new(format!("line {idx}"), LineKind::Plain))
-                .collect(),
-            3,
-        );
-
-        assert_eq!(state.scroll_top, 2);
-        assert_eq!(state.unseen_output_lines, 2);
-        assert!(!state.follow_output);
-    }
-
-    #[test]
-    fn user_messages_use_distinct_line_kind() {
-        let message = AgentMessage::User(agent_model::LlmMessage {
-            role: agent_model::LlmRole::User,
-            parts: vec![agent_model::MessagePart::Text(agent_model::TextPart {
-                text: "hello".to_string(),
-            })],
-        });
-
-        let lines = format_message(&message);
-        assert_eq!(lines[0].kind, LineKind::User);
-        assert_eq!(lines[0].text, "▌  hello");
-    }
-
-    fn block_texts(block: &RenderBlock) -> Vec<String> {
-        block.lines.iter().map(|line| line.text.clone()).collect()
-    }
-
-}
-
-struct Terminal {
-    stdout: Stdout,
-    entered: bool,
-}
-
-impl Terminal {
-    fn new() -> Self {
-        Self {
-            stdout: stdout(),
-            entered: false,
-        }
-    }
-
-    fn enter(&mut self) -> anyhow::Result<()> {
-        if self.entered {
-            return Ok(());
-        }
-
-        enable_raw_mode().context("failed to enable raw mode")?;
-        execute!(
-            self.stdout,
-            EnableBracketedPaste,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            )
-        )
-        .ok();
-        self.entered = true;
-        Ok(())
-    }
-
-    fn leave(&mut self) -> anyhow::Result<()> {
-        if !self.entered {
-            return Ok(());
-        }
-
-        execute!(
-            self.stdout,
-            Show,
-            DisableBracketedPaste,
-            PopKeyboardEnhancementFlags
-        )
-        .ok();
-        disable_raw_mode().context("failed to disable raw mode")?;
-        self.entered = false;
-        Ok(())
-    }
-}
-
-impl Drop for Terminal {
-    fn drop(&mut self) {
-        let _ = self.leave();
     }
 }
 
@@ -938,92 +563,59 @@ impl TuiState {
         self.cursor = cursor_for_row_col(&chars, target_row, col);
     }
 
-    fn render_lines(&self) -> Vec<StyledLine> {
-        let mut lines = Vec::new();
-        for (index, block) in self.blocks.iter().enumerate() {
+    fn render_committed_lines_from(&self, width: usize, start_block: usize) -> Vec<StyledLine> {
+        let mut raw_lines = Vec::new();
+        for (index, block) in self.committed_blocks.iter().enumerate().skip(start_block) {
             if index > 0 && block.kind != BlockKind::System {
+                raw_lines.push(StyledLine::blank());
+            }
+            raw_lines.extend(block.lines.iter().cloned());
+        }
+        wrap_lines(&raw_lines, width)
+    }
+
+    fn render_live_lines(&self, width: usize, max_lines: usize) -> Vec<StyledLine> {
+        if self.live_assistant.is_none()
+            && self.live_tool.is_none()
+            && !self.status.starts_with("Running")
+        {
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+        let title = self.live_title();
+        if !title.is_empty() {
+            lines.extend(
+                wrap_line_by_display_width(&title, width)
+                    .into_iter()
+                    .map(|line| StyledLine::new(line, LineKind::Status)),
+            );
+        }
+
+        if let Some(block) = &self.live_tool {
+            let mut tool_lines = wrap_lines(&block.lines, width);
+            if !tool_lines.is_empty() {
                 lines.push(StyledLine::blank());
             }
-            lines.extend(block.lines.iter().cloned());
-        }
-        lines
-    }
-
-    fn visible_log_lines(&self) -> &[StyledLine] {
-        let lines = self.active_log_lines();
-        if self.rendered_log_height == 0 {
-            return &[];
-        }
-        let max_start = lines.len().saturating_sub(self.rendered_log_height);
-        let start = if self.follow_output {
-            max_start
-        } else {
-            self.scroll_top.min(max_start)
-        };
-        let end = (start + self.rendered_log_height).min(lines.len());
-        &lines[start..end]
-    }
-
-    fn page_scroll_amount(&self) -> usize {
-        self.viewport_height.saturating_sub(3) as usize
-    }
-
-    fn scroll_up(&mut self, amount: usize) {
-        if self.follow_output {
-            self.scroll_top = self
-                .rendered_lines
-                .len()
-                .saturating_sub(self.rendered_log_height);
-            self.frozen_lines = Some(self.rendered_lines.clone());
-        }
-        self.follow_output = false;
-        self.scroll_top = self.scroll_top.saturating_sub(amount);
-    }
-
-    fn scroll_down(&mut self, amount: usize) {
-        if self.follow_output {
-            return;
+            let keep = tool_lines.len().saturating_sub(3);
+            lines.extend(tool_lines.drain(keep..));
         }
 
-        let max_start = self
-            .active_log_lines()
-            .len()
-            .saturating_sub(self.rendered_log_height);
-        let next = self.scroll_top.saturating_add(amount);
-        if next >= max_start {
-            self.follow_output = true;
-            self.scroll_top = self
-                .rendered_lines
-                .len()
-                .saturating_sub(self.rendered_log_height);
-            self.unseen_output_lines = 0;
-            self.frozen_lines = None;
-        } else {
-            self.scroll_top = next;
-        }
-    }
-
-    fn update_rendered_lines(&mut self, log_lines: Vec<StyledLine>, log_height: usize) {
-        let previous_rendered_len = self.rendered_lines.len();
-        self.rendered_lines = log_lines;
-        self.rendered_log_height = log_height;
-
-        let max_start = self.rendered_lines.len().saturating_sub(log_height);
-        if self.follow_output {
-            self.scroll_top = max_start;
-            self.unseen_output_lines = 0;
-        } else {
-            if self.rendered_lines.len() > previous_rendered_len {
-                self.unseen_output_lines = self
-                    .unseen_output_lines
-                    .saturating_add(self.rendered_lines.len() - previous_rendered_len);
+        if let Some(block) = &self.live_assistant {
+            let mut assistant_lines = wrap_lines(&block.lines, width);
+            assistant_lines.retain(|line| !line.text.trim().is_empty());
+            if !assistant_lines.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(StyledLine::blank());
+                }
+                lines.extend(assistant_lines);
             }
-            let frozen_max_start = self
-                .frozen_lines
-                .as_ref()
-                .map(|lines| lines.len().saturating_sub(log_height))
-                .unwrap_or(0);
-            self.scroll_top = self.scroll_top.min(frozen_max_start);
+        }
+
+        if lines.len() > max_lines {
+            lines.split_off(lines.len() - max_lines)
+        } else {
+            lines
         }
     }
 
@@ -1031,7 +623,7 @@ impl TuiState {
         let mut parts = Vec::new();
         if !self.status.is_empty() && self.status != "Ready" {
             if self.status.starts_with("Running") {
-                parts.push(self.status.clone());
+                parts.push("Working".to_string());
                 if let Some(status_since) = self.status_since {
                     parts.push(format_elapsed(status_since.elapsed()));
                 }
@@ -1040,33 +632,18 @@ impl TuiState {
                 parts.push(self.status.clone());
             }
         }
-        if !self.follow_output && self.unseen_output_lines > 0 {
-            parts.push(format!(
-                "{} new line{} below",
-                self.unseen_output_lines,
-                if self.unseen_output_lines == 1 { "" } else { "s" }
-            ));
-        }
         parts.join(" · ")
     }
 
-    fn hint_line(&self) -> String {
-        if self.status.starts_with("Running") {
-            return self.footer_info_line();
+    fn info_line(&self) -> String {
+        let status = self.status_line();
+        let footer = self.footer_info_line();
+        match (status.is_empty(), footer.is_empty()) {
+            (false, false) => format!("{status} · {footer}"),
+            (false, true) => status,
+            (true, false) => footer,
+            (true, true) => String::new(),
         }
-        if !self.selection_items.is_empty() {
-            return "Enter select · Esc cancel".to_string();
-        }
-        let mut parts = Vec::new();
-        if !self.follow_output {
-            parts.push("PgUp/PgDn scroll".to_string());
-            parts.push("End latest".to_string());
-        }
-        let footer_info = self.footer_info_line();
-        if !footer_info.is_empty() {
-            parts.push(footer_info);
-        }
-        parts.join(" · ")
     }
 
     fn footer_info_line(&self) -> String {
@@ -1087,44 +664,52 @@ impl TuiState {
         parts.join(" · ")
     }
 
+    fn live_title(&self) -> String {
+        let mut parts = Vec::new();
+        if self.live_tool.is_some() {
+            parts.push("Using tools".to_string());
+        } else if self.live_assistant.is_some() || self.status.starts_with("Running") {
+            parts.push("Composing reply".to_string());
+        }
+
+        if let Some(status_since) = self.status_since {
+            parts.push(format_elapsed(status_since.elapsed()));
+        }
+        parts.join(" · ")
+    }
+
     fn push_user_input(&mut self, text: &str) {
-        self.blocks.push(RenderBlock {
+        self.committed_blocks.push(RenderBlock {
             lines: message_lines(USER_PREFIX, text, LineKind::User),
             kind: BlockKind::Conversation,
         });
-        self.active_assistant = None;
-        self.active_tool = None;
+        self.live_assistant = None;
+        self.live_tool = None;
     }
 
     fn push_message(&mut self, message: &AgentMessage) {
-        self.blocks.push(RenderBlock {
+        self.committed_blocks.push(RenderBlock {
             lines: format_message(message),
             kind: classify_block_from_message(message),
         });
-        self.active_assistant = None;
-        self.active_tool = None;
+        self.live_assistant = None;
+        self.live_tool = None;
     }
 
     fn push_system_note(&mut self, note: impl Into<String>) {
         let note = note.into();
-        self.blocks.push(RenderBlock {
+        self.committed_blocks.push(RenderBlock {
             lines: message_lines("· ", &note, LineKind::System),
             kind: BlockKind::System,
         });
-        self.active_assistant = None;
-        self.active_tool = None;
+        self.live_assistant = None;
+        self.live_tool = None;
     }
 
     fn replace_messages(&mut self, messages: &[AgentMessage]) {
-        self.blocks.clear();
-        self.active_assistant = None;
-        self.active_tool = None;
-        self.scroll_top = 0;
-        self.follow_output = true;
-        self.unseen_output_lines = 0;
-        self.rendered_lines.clear();
-        self.rendered_log_height = 0;
-        self.frozen_lines = None;
+        self.committed_blocks.clear();
+        self.live_assistant = None;
+        self.live_tool = None;
         self.status_since = None;
         for message in messages {
             self.push_message(message);
@@ -1133,108 +718,306 @@ impl TuiState {
 
     fn apply_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::AgentStart => {}
-            AgentEvent::TurnStart => {}
+            AgentEvent::AgentStart | AgentEvent::TurnStart => {}
             AgentEvent::MessageStart { role } => match role {
                 agent_model::LlmRole::Assistant => {
-                    self.blocks.push(RenderBlock {
+                    self.live_assistant = Some(RenderBlock {
                         lines: vec![StyledLine::new("", LineKind::Plain)],
                         kind: BlockKind::Conversation,
                     });
-                    self.active_assistant = Some(self.blocks.len() - 1);
                 }
-                agent_model::LlmRole::User | agent_model::LlmRole::System => {}
                 agent_model::LlmRole::Tool => {
-                    self.blocks.push(RenderBlock {
+                    self.live_tool = Some(RenderBlock {
                         lines: vec![StyledLine::new("· tool", LineKind::Tool)],
                         kind: BlockKind::Tool,
                     });
-                    self.active_tool = Some(self.blocks.len() - 1);
                 }
+                agent_model::LlmRole::User | agent_model::LlmRole::System => {}
             },
             AgentEvent::TextDelta(delta) => {
-                if let Some(index) = self.active_assistant {
-                    append_text_to_block(&mut self.blocks[index], "", &delta);
+                if let Some(block) = self.live_assistant.as_mut() {
+                    append_text_to_block(block, "", &delta);
                 } else {
-                    self.blocks.push(RenderBlock {
+                    self.live_assistant = Some(RenderBlock {
                         lines: vec![StyledLine::new(delta, LineKind::Plain)],
                         kind: BlockKind::Conversation,
                     });
                 }
             }
             AgentEvent::ToolCallStart { id, name } => {
-                self.blocks.push(RenderBlock {
-                    lines: vec![StyledLine::new(format!("· tool {name} ({id})"), LineKind::Tool)],
+                self.live_tool = Some(RenderBlock {
+                    lines: vec![StyledLine::new(
+                        format!("· tool {name} ({id})"),
+                        LineKind::Tool,
+                    )],
                     kind: BlockKind::Tool,
                 });
-                self.active_tool = Some(self.blocks.len() - 1);
             }
             AgentEvent::ToolCallArgsDelta { delta, .. } => {
-                if let Some(index) = self.active_tool {
-                    append_text_to_block(&mut self.blocks[index], "  ", &delta);
+                if let Some(block) = self.live_tool.as_mut() {
+                    append_text_to_block(block, "  ", &delta);
                 }
             }
             AgentEvent::ToolCallEnd { id } => {
-                if let Some(index) = self.active_tool.take() {
-                    self.blocks[index]
+                if let Some(block) = self.live_tool.as_mut() {
+                    block
                         .lines
                         .push(StyledLine::new(format!("  done {id}"), LineKind::Tool));
                 }
             }
+            AgentEvent::Usage(usage) => {
+                self.latest_usage = Some(usage);
+            }
             AgentEvent::MessageEnd { message, .. } => match message.role {
                 agent_model::LlmRole::Assistant => {
-                    if let Some(index) = self.active_assistant.take() {
-                        self.blocks[index].lines = format_message(&AgentMessage::Assistant(message));
-                    }
+                    self.live_assistant = None;
+                    self.committed_blocks.push(RenderBlock {
+                        lines: format_message(&AgentMessage::Assistant(message)),
+                        kind: BlockKind::Conversation,
+                    });
                 }
                 agent_model::LlmRole::Tool => {
-                    if let Some(index) = self.active_tool.take() {
-                        self.blocks[index].lines = format_message(&AgentMessage::ToolResult(message));
-                    }
+                    self.live_tool = None;
+                    self.committed_blocks.push(RenderBlock {
+                        lines: format_message(&AgentMessage::ToolResult(message)),
+                        kind: BlockKind::Tool,
+                    });
                 }
                 agent_model::LlmRole::User | agent_model::LlmRole::System => {}
             },
             AgentEvent::ToolResultReady { message } => {
-                self.blocks.push(RenderBlock {
+                self.committed_blocks.push(RenderBlock {
                     lines: format_message(&AgentMessage::ToolResult(message)),
                     kind: BlockKind::Tool,
                 });
-                self.active_tool = None;
-            }
-            AgentEvent::Usage(usage) => {
-                self.latest_usage = Some(usage);
+                self.live_tool = None;
             }
             AgentEvent::TurnEnd { .. } => {}
             AgentEvent::AgentEnd => {
-                self.active_assistant = None;
-                self.active_tool = None;
+                self.live_assistant = None;
+                self.live_tool = None;
             }
         }
     }
+}
 
-    fn active_log_lines(&self) -> &[StyledLine] {
-        self.frozen_lines
-            .as_ref()
-            .map(|lines| lines.as_slice())
-            .unwrap_or(self.rendered_lines.as_slice())
+fn render_frame(frame: &mut Frame<'_>, state: &TuiState) {
+    if state.selection_items.is_empty() {
+        render_bottom_frame(frame, state);
+    } else {
+        render_selection_frame(frame, state);
     }
 }
 
-fn clip_to_width(text: &str, width: usize) -> String {
-    let mut clipped = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let ch_width = display_width_char(ch);
-        if !clipped.is_empty() && used + ch_width > width {
-            break;
+fn handle_running_key_state(state: &mut TuiState, key: KeyEvent) -> RunningAction {
+    match key.code {
+        KeyCode::Esc => RunningAction::Abort,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => RunningAction::Quit,
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.insert_char('\n');
+            RunningAction::Continue
         }
-        clipped.push(ch);
-        used += ch_width;
-        if used >= width {
-            break;
+        KeyCode::Enter
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            state.insert_char('\n');
+            RunningAction::Continue
         }
+        KeyCode::Enter => {
+            let text = std::mem::take(&mut state.input);
+            state.cursor = 0;
+            if text.trim().is_empty() {
+                RunningAction::Continue
+            } else {
+                RunningAction::QueueSubmit(text)
+            }
+        }
+        KeyCode::Backspace => {
+            state.backspace();
+            RunningAction::Continue
+        }
+        KeyCode::Delete => {
+            state.delete();
+            RunningAction::Continue
+        }
+        KeyCode::Left => {
+            state.move_left();
+            RunningAction::Continue
+        }
+        KeyCode::Right => {
+            state.move_right();
+            RunningAction::Continue
+        }
+        KeyCode::Home => {
+            state.move_to_line_start();
+            RunningAction::Continue
+        }
+        KeyCode::End => {
+            state.move_to_line_end();
+            RunningAction::Continue
+        }
+        KeyCode::Up => {
+            state.move_vertical(-1);
+            RunningAction::Continue
+        }
+        KeyCode::Down => {
+            state.move_vertical(1);
+            RunningAction::Continue
+        }
+        KeyCode::Char(ch) => {
+            state.insert_char(ch);
+            RunningAction::Continue
+        }
+        _ => RunningAction::Continue,
     }
-    clipped
+}
+
+fn render_bottom_frame(frame: &mut Frame<'_>, state: &TuiState) {
+    let area = frame.area();
+    let width = area.width as usize;
+    let height = area.height as usize;
+    let (lines, cursor_row, cursor_col) = bottom_lines(state, width, height);
+
+    frame.render_widget(
+        Paragraph::new(Text::from(ratatui_lines(&lines, width))),
+        area,
+    );
+    frame.set_cursor_position(Position::new(
+        area.x + cursor_col.min(width.saturating_sub(1)) as u16,
+        area.y + cursor_row.min(height.saturating_sub(1)) as u16,
+    ));
+}
+
+fn render_selection_frame(frame: &mut Frame<'_>, state: &TuiState) {
+    let area = frame.area();
+    let width = area.width as usize;
+    let height = area.height as usize;
+    let mut lines = Vec::new();
+
+    let title = state.selection_title.as_deref().unwrap_or("Select");
+    lines.push(StyledLine::new(title, LineKind::Status));
+
+    let capacity = height.saturating_sub(2).max(1);
+    let max_scroll = state.selection_items.len().saturating_sub(capacity);
+    let start = state
+        .selection_index
+        .saturating_sub(capacity / 2)
+        .min(max_scroll);
+    let end = (start + capacity).min(state.selection_items.len());
+
+    for item_index in start..end {
+        let marker = if item_index == state.selection_index {
+            "›"
+        } else {
+            " "
+        };
+        let kind = if item_index == state.selection_index {
+            LineKind::Selection
+        } else {
+            LineKind::Plain
+        };
+        lines.push(StyledLine::new(
+            format!("{marker} {}", state.selection_items[item_index]),
+            kind,
+        ));
+    }
+
+    lines.push(StyledLine::new("Enter select · Esc cancel", LineKind::Hint));
+    while lines.len() < height {
+        lines.push(StyledLine::blank());
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(ratatui_lines(&lines, width))),
+        area,
+    );
+    frame.set_cursor_position(Position::new(area.x, area.y));
+}
+
+fn bottom_lines(state: &TuiState, width: usize, height: usize) -> (Vec<StyledLine>, usize, usize) {
+    let height = height.max(1);
+    let info_line = state.info_line();
+    let info_rows = usize::from(!info_line.is_empty());
+    let input_lines = render_input_lines(&state.input, width);
+    let max_input_rows = height.saturating_sub(info_rows).max(1);
+    let input_start = input_lines.len().saturating_sub(max_input_rows);
+    let visible_input = input_lines
+        .iter()
+        .enumerate()
+        .skip(input_start)
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                INPUT_PREFIX
+            } else {
+                INPUT_CONTINUATION_PREFIX
+            };
+            StyledLine::new(format!("{prefix}{line}"), LineKind::Input)
+        })
+        .collect::<Vec<_>>();
+
+    let occupied_tail_rows = visible_input.len() + info_rows;
+    let live_capacity = height.saturating_sub(occupied_tail_rows + 1);
+    let mut live_lines = state.render_live_lines(width, live_capacity);
+    let mut lines = Vec::new();
+
+    if !live_lines.is_empty() {
+        lines.append(&mut live_lines);
+        lines.push(StyledLine::blank());
+    }
+    let input_row_offset = lines.len();
+    lines.extend(visible_input);
+    if !info_line.is_empty() && lines.len() < height {
+        lines.push(StyledLine::new(info_line, LineKind::Hint));
+    }
+
+    if lines.len() > height {
+        lines = lines.split_off(lines.len() - height);
+    }
+
+    while lines.len() < height {
+        lines.push(StyledLine::blank());
+    }
+
+    let (cursor_row, cursor_col) = cursor_position_for_input(&state.input, state.cursor, width, 0);
+    let visible_cursor_row = (cursor_row as usize).saturating_sub(input_start).min(
+        input_lines
+            .len()
+            .saturating_sub(input_start)
+            .saturating_sub(1),
+    );
+    let row = input_row_offset + visible_cursor_row;
+
+    (lines, row, cursor_col)
+}
+
+fn ratatui_lines(lines: &[StyledLine], width: usize) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            let clipped = clip_to_width(&line.text, width);
+            let text = match line.kind {
+                LineKind::Selection | LineKind::User => pad_to_display_width(&clipped, width),
+                _ => clipped,
+            };
+            Line::from(Span::styled(text, style_for_kind(line.kind)))
+        })
+        .collect()
+}
+
+fn style_for_kind(kind: LineKind) -> Style {
+    match kind {
+        LineKind::Plain | LineKind::Input => Style::default(),
+        LineKind::User => Style::default().fg(Color::White).bg(Color::Rgb(54, 58, 64)),
+        LineKind::System => Style::default().fg(Color::DarkGray),
+        LineKind::Tool => Style::default().fg(Color::Cyan),
+        LineKind::Selection => Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(78, 82, 88))
+            .add_modifier(Modifier::BOLD),
+        LineKind::Status => Style::default().fg(Color::Gray),
+        LineKind::Hint => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn wrap_lines(lines: &[StyledLine], width: usize) -> Vec<StyledLine> {
@@ -1261,157 +1044,21 @@ fn wrap_lines(lines: &[StyledLine], width: usize) -> Vec<StyledLine> {
     wrapped
 }
 
-fn apply_style(stdout: &mut Stdout, kind: LineKind) -> anyhow::Result<()> {
-    match kind {
-        LineKind::Plain | LineKind::Input => queue!(stdout, ResetColor)?,
-        LineKind::User => queue!(
-            stdout,
-            SetForegroundColor(Color::White),
-            SetBackgroundColor(Color::Rgb {
-                r: 54,
-                g: 58,
-                b: 64,
-            })
-        )?,
-        LineKind::System => queue!(stdout, SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset))?,
-        LineKind::Tool => queue!(stdout, SetForegroundColor(Color::Cyan), SetBackgroundColor(Color::Reset))?,
-        LineKind::Selection => queue!(
-            stdout,
-            SetForegroundColor(Color::White),
-            SetBackgroundColor(Color::Rgb {
-                r: 78,
-                g: 82,
-                b: 88,
-            })
-        )?,
-        LineKind::Divider => queue!(stdout, SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset))?,
-        LineKind::Status => queue!(stdout, SetForegroundColor(Color::Grey), SetBackgroundColor(Color::Reset))?,
-        LineKind::Hint => queue!(stdout, SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset))?,
+fn clip_to_width(text: &str, width: usize) -> String {
+    let mut clipped = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = display_width_char(ch);
+        if !clipped.is_empty() && used + ch_width > width {
+            break;
+        }
+        clipped.push(ch);
+        used += ch_width;
+        if used >= width {
+            break;
+        }
     }
-    Ok(())
-}
-
-fn overlay_selection(
-    frame: &mut [StyledLine],
-    width: usize,
-    height: usize,
-    title: &str,
-    items: &[String],
-    selection_index: usize,
-) {
-    if width < 24 || height < 10 {
-        return;
-    }
-
-    let content_width = items
-        .iter()
-        .map(|item| display_width(item))
-        .max()
-        .unwrap_or(0)
-        .max(display_width(title))
-        .min(width.saturating_sub(8));
-    let preferred_width = width.saturating_sub(6);
-    let box_width = (content_width + 6)
-        .max(preferred_width.min(width.saturating_sub(4)))
-        .clamp(36, width.saturating_sub(4));
-    let available_height = height.saturating_sub(4);
-    let content_capacity = available_height.saturating_sub(4).max(4);
-    let visible_items = items.len().min(content_capacity);
-    let min_box_height = (height.saturating_mul(2) / 3).clamp(8, available_height);
-    let box_height = (visible_items + 4).max(min_box_height).min(available_height);
-    let left = (width.saturating_sub(box_width)) / 2;
-    let top = ((height.saturating_sub(box_height)).saturating_sub(1)) / 2;
-
-    let max_scroll = items.len().saturating_sub(visible_items);
-    let start = selection_index
-        .saturating_sub(visible_items / 2)
-        .min(max_scroll);
-    let end = (start + visible_items).min(items.len());
-    let horizontal = "─".repeat(box_width.saturating_sub(2));
-
-    put_overlay_line(
-        frame,
-        top,
-        left,
-        width,
-        &format!("┌{horizontal}┐"),
-        LineKind::Divider,
-    );
-    put_overlay_line(
-        frame,
-        top + 1,
-        left,
-        width,
-        &format!("│ {} │", pad_to_display_width(&clip_to_width(title, box_width.saturating_sub(4)), box_width.saturating_sub(4))),
-        LineKind::Status,
-    );
-    put_overlay_line(
-        frame,
-        top + 2,
-        left,
-        width,
-        &format!("├{horizontal}┤"),
-        LineKind::Divider,
-    );
-
-    for (row_offset, item_index) in (start..end).enumerate() {
-        let marker = if item_index == selection_index { "›" } else { " " };
-        let item = &items[item_index];
-        put_overlay_line(
-            frame,
-            top + 3 + row_offset,
-            left,
-            width,
-            &format!(
-                "│ {} {} │",
-                marker,
-                pad_to_display_width(
-                    &clip_to_width(item, box_width.saturating_sub(6)),
-                    box_width.saturating_sub(6)
-                )
-            ),
-            if item_index == selection_index {
-                LineKind::Selection
-            } else {
-                LineKind::Hint
-            },
-        );
-    }
-
-    for row in (top + 3 + (end - start))..(top + box_height - 1) {
-        put_overlay_line(
-            frame,
-            row,
-            left,
-            width,
-            &format!("│ {} │", " ".repeat(box_width.saturating_sub(4))),
-            LineKind::Hint,
-        );
-    }
-
-    put_overlay_line(
-        frame,
-        top + box_height - 1,
-        left,
-        width,
-        &format!("└{horizontal}┘"),
-        LineKind::Divider,
-    );
-}
-
-fn put_overlay_line(
-    frame: &mut [StyledLine],
-    row: usize,
-    left: usize,
-    width: usize,
-    text: &str,
-    kind: LineKind,
-) {
-    if row >= frame.len() {
-        return;
-    }
-    let prefix = " ".repeat(left);
-    frame[row] = StyledLine::new(clip_to_width(&format!("{prefix}{text}"), width), kind);
+    clipped
 }
 
 fn char_to_byte_index(text: &str, char_index: usize) -> usize {
@@ -1473,6 +1120,10 @@ fn should_handle_key_event(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+fn selection_page_size() -> usize {
+    INLINE_VIEWPORT_HEIGHT.saturating_sub(3).max(1) as usize
+}
+
 fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     if seconds < 60 {
@@ -1515,5 +1166,221 @@ fn pad_to_display_width(text: &str, width: usize) -> String {
         text.to_string()
     } else {
         format!("{text}{}", " ".repeat(width - current))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_keys_map_to_abort_and_quit_actions() {
+        let mut state = TuiState::default();
+
+        let abort =
+            handle_running_key_state(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(abort, RunningAction::Abort));
+
+        let quit = handle_running_key_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(quit, RunningAction::Quit));
+
+        let cont =
+            handle_running_key_state(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(cont, RunningAction::Continue));
+    }
+
+    #[test]
+    fn prompt_reset_keeps_existing_status() {
+        let mut state = TuiState::default();
+        state.set_status("Provider mismatch, /fork recommended");
+        state.input = "pending".to_string();
+        state.cursor = 7;
+
+        state.input.clear();
+        state.cursor = 0;
+
+        assert_eq!(state.status, "Provider mismatch, /fork recommended");
+        assert!(state.input.is_empty());
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn system_notes_split_multiline_text_into_lines() {
+        let mut state = TuiState::default();
+        state.push_system_note("first line\nsecond line");
+
+        assert_eq!(
+            block_texts(state.committed_blocks.last().unwrap()),
+            vec!["· first line".to_string(), "· second line".to_string()]
+        );
+    }
+
+    #[test]
+    fn format_message_splits_multiline_tool_output() {
+        let message = AgentMessage::ToolResult(agent_model::LlmMessage {
+            role: agent_model::LlmRole::Tool,
+            parts: vec![agent_model::MessagePart::ToolResult(
+                agent_model::ToolResultPart {
+                    call_id: "call-1".to_string(),
+                    content: "line one\nline two".to_string(),
+                    is_error: false,
+                },
+            )],
+        });
+
+        assert_eq!(
+            format_message(&message)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>(),
+            vec![
+                "· tool result call-1".to_string(),
+                "  line one".to_string(),
+                "  line two".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_wrapping_uses_display_width_for_wide_characters() {
+        let lines = render_input_lines("안녕하세요", 8);
+        assert_eq!(lines, vec!["안녕하".to_string(), "세요".to_string()]);
+    }
+
+    #[test]
+    fn insert_text_preserves_multiline_paste() {
+        let mut state = TuiState::default();
+        state.insert_text("first\nsecond");
+
+        assert_eq!(state.input, "first\nsecond");
+        assert_eq!(state.cursor, "first\nsecond".chars().count());
+    }
+
+    #[test]
+    fn cursor_position_accounts_for_wider_input_prefix() {
+        let (row, col) = cursor_position_for_input("hello", 5, 20, 6);
+        assert_eq!(row, 6);
+        assert_eq!(col, INPUT_PREFIX_WIDTH + 5);
+    }
+
+    #[test]
+    fn token_count_is_compactly_formatted() {
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_500), "1.5k");
+        assert_eq!(format_token_count(2_500_000), "2.5m");
+    }
+
+    #[test]
+    fn user_messages_use_distinct_line_kind() {
+        let message = AgentMessage::User(agent_model::LlmMessage {
+            role: agent_model::LlmRole::User,
+            parts: vec![agent_model::MessagePart::Text(agent_model::TextPart {
+                text: "hello".to_string(),
+            })],
+        });
+
+        let lines = format_message(&message);
+        assert_eq!(lines[0].kind, LineKind::User);
+        assert_eq!(lines[0].text, "▌  hello");
+    }
+
+    #[test]
+    fn bottom_frame_keeps_prompt_adjacent_to_transcript_when_idle() {
+        let state = TuiState {
+            input: "hello".to_string(),
+            cursor: 5,
+            ..Default::default()
+        };
+
+        let (lines, cursor_row, cursor_col) = bottom_lines(&state, 20, 4);
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts[0], "> hello");
+        assert!(texts[1].contains("usage n/a"));
+        assert_eq!(cursor_row, 0);
+        assert_eq!(cursor_col, INPUT_PREFIX_WIDTH + 5);
+    }
+
+    #[test]
+    fn bottom_frame_uses_available_space_for_live_assistant_output() {
+        let mut state = TuiState::default();
+        state.set_status("Running");
+        state.apply_event(AgentEvent::MessageStart {
+            role: agent_model::LlmRole::Assistant,
+        });
+        state.apply_event(AgentEvent::TextDelta(
+            "one\ntwo\nthree\nfour\nfive".to_string(),
+        ));
+
+        let (lines, _, _) = bottom_lines(&state, 30, 10);
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(texts.contains(&"one"));
+        assert!(texts.contains(&"two"));
+        assert!(texts.contains(&"three"));
+        assert!(texts.contains(&"four"));
+        assert!(texts.contains(&"five"));
+        assert!(!texts.contains(&"Reply preview"));
+    }
+
+    #[test]
+    fn ratatui_inline_viewport_preserves_committed_scrollback() {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(24, 4);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+
+        terminal
+            .draw(|frame| {
+                Paragraph::new("> prompt\nstatus").render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+
+        terminal
+            .insert_before(3, |buf| {
+                Paragraph::new("first\nsecond\nthird").render(buf.area, buf);
+            })
+            .unwrap();
+        terminal
+            .insert_before(2, |buf| {
+                Paragraph::new("fourth\nfifth").render(buf.area, buf);
+            })
+            .unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new("> prompt\nstatus").render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+
+        terminal.backend().assert_scrollback_lines([
+            "first                   ",
+            "second                  ",
+            "third                   ",
+        ]);
+        terminal.backend().assert_buffer_lines([
+            "fourth                  ",
+            "fifth                   ",
+            "> prompt                ",
+            "status                  ",
+        ]);
+    }
+
+    fn block_texts(block: &RenderBlock) -> Vec<String> {
+        block.lines.iter().map(|line| line.text.clone()).collect()
     }
 }
