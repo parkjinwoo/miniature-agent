@@ -20,6 +20,7 @@ async-stream = "0.3.6"
 async-trait = "0.1.89"
 crossterm = "0.29.0"
 futures = "0.3.31"
+libc = "0.2.177"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_29"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 secrecy = "0.10.3"
