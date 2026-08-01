@@ -3,6 +3,8 @@
 ## Automated Gate
 
 - Run `cargo check`
+- Run `cargo fmt --all -- --check`
+- Run `cargo clippy --workspace --all-targets -- -D warnings`
 - Run `cargo test --workspace`
 - Confirm no unexpected local diff in generated session files or temp fixtures
 - Run `cargo run -p agent-cli -- --print-paths`
@@ -20,11 +22,14 @@ Run each item from a clean workspace copy if possible.
 4. Ask for a file write or edit inside the workspace and confirm the file changed as expected.
 5. Abort an in-flight response with `Esc` and confirm the session does not append a partial run.
 6. Re-open the same session and confirm transcript replay matches the saved session file.
+7. Confirm a repeated tool loop stops at the configured turn limit.
 
 ## Non-Interactive Smoke
 
 - Run `cargo run -p agent-cli -- --provider <name> --prompt "hello"`
 - Confirm the command either prints a streamed turn result or fails with a provider/network error instead of a TUI/raw-mode error
+- Confirm prompt mode exposes only `read` unless `--full-access` is explicitly passed
+- Confirm a timed-out shell command is terminated and reports a timeout tool result
 
 ## Session Smoke
 
@@ -34,6 +39,8 @@ Run each item from a clean workspace copy if possible.
 4. Run `/sessions` and confirm the current session is listed with provider/model info.
 5. Run `/paths` and confirm the shown config/state/session paths match the expected XDG locations.
 6. Run `/fork` and confirm a new session file is created with the current provider snapshot.
+7. Branch from an older checkpoint, fork it, and confirm messages from the abandoned branch are absent.
+8. Test a copied session with a truncated final JSONL record and confirm the complete prefix opens.
 
 ## Provider Smoke
 
@@ -57,6 +64,7 @@ Run each item from a clean workspace copy if possible.
 - Local servers may leave `MINIATURE_AGENT_COMPATIBLE_API_KEY` unset
 - Confirm provider/model mismatch markers in `/sessions` look correct
 - Confirm at least one tool call round-trip succeeds
+- For a backend requiring tool-result names, confirm the original function name is used
 
 ## Provider Mismatch Smoke
 

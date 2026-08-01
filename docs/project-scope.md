@@ -1,14 +1,15 @@
 # Project Scope
 
-`miniature-agent` is a small coding agent project for learning.
+`miniature-agent` is a small, durable, local-first coding agent.
 
-The goal is not to build the largest or most feature-rich agent. The goal is to build one that stays understandable while teaching useful lessons about agent design, memory, tools, sessions, and recovery.
+The goal is not to build the largest or most feature-rich agent. The goal is to build one whose execution can be understood, whose history can be trusted, and whose work can be resumed after interruption.
 
 ## Direction
 
-- keep the system small
-- keep the behavior explicit
-- keep the defaults stable
+- keep the system small and inspectable
+- treat the session format as durable user data
+- make side effects and trust decisions explicit
+- support multiple model providers through one tested behavior contract
 - keep the codebase readable for the next contributor
 
 ## What Matters
@@ -18,12 +19,17 @@ The goal is not to build the largest or most feature-rich agent. The goal is to 
 - simplicity
 - friendliness
 - memory that can be resumed and used, not just stored
+- clear trust boundaries
+- deterministic recovery
+- provider conformance
 
 ## What This Project Avoids
 
 - feature growth for its own sake
 - platform ambitions
 - large extension systems
+- multi-agent orchestration
+- unrestricted automation as a default
 - new modes or subsystems when prompt, tools, or sessions are enough
 
 ## Rule Of Thumb
@@ -35,4 +41,4 @@ When a new idea appears, prefer:
 3. improving clarity in the prompt or UI
 4. not adding the feature
 
-The project may change in later versions. This document only describes the current direction.
+The phased implementation plan is in [`modernization-plan.md`](modernization-plan.md).

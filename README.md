@@ -13,6 +13,8 @@ Its purpose is not just to keep a flat transcript, but to give you an environmen
 - append-only JSONL sessions with resume, fork, checkpoint selection, and summary-based compaction
 - built-in `read`, `write`, `edit`, and `bash` tools
 - a `crossterm` TUI and a non-interactive `--prompt` mode
+- recovery from interrupted trailing session writes and branch-correct session forks
+- bounded model turns, file reads, and returned tool output
 
 ## Install
 
@@ -35,6 +37,9 @@ Then run:
 ```bash
 miniature-agent
 ```
+
+Run `miniature-agent --help` for the complete command list. Invalid or incomplete flags fail with
+an actionable error instead of silently falling back to another provider or mode.
 
 ## Config And Session Paths
 
@@ -90,6 +95,13 @@ miniature-agent
 
 ```bash
 miniature-agent --provider openai --prompt "read src/main.rs"
+```
+
+Non-interactive prompt mode is read-only by default. To deliberately expose `write`, `edit`, and
+`bash`, add `--full-access`:
+
+```bash
+miniature-agent --provider openai --prompt "fix the failing tests" --full-access
 ```
 
 ## Minimal Config
@@ -148,15 +160,32 @@ Inside the TUI:
 - `/paths`
 - `/compact`
 
+## Safety Model
+
+The file tools reject paths that escape the starting workspace, including escapes through existing
+symbolic links. Reads larger than 1 MiB are rejected, captured shell output is memory-bounded, and
+a prompt is stopped after 16 model turns to prevent an unbounded tool loop. Shell commands default
+to a 30-second timeout, can request at most 120 seconds, and have their remaining process group
+terminated when the command exits or times out.
+
+Non-interactive `--prompt` runs expose only `read` unless `--full-access` is passed. The interactive
+TUI still executes `write`, `edit`, and `bash` calls without a per-action approval step, so use it
+only in a workspace and account you are comfortable allowing the model to modify. An interactive
+`ask` policy with command and diff previews is the highest-priority follow-up work.
+
 ## Verification
 
 - `cargo check`
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 - `miniature-agent --print-paths`
 - `miniature-agent --provider <name> --prompt "hello"`
 
 Before tagging a release, follow [`docs/v1-release-checklist.md`](docs/v1-release-checklist.md).
 For the current project direction and non-goals, see [`docs/project-scope.md`](docs/project-scope.md).
+For the modernization priorities and release sequence, see
+[`docs/modernization-plan.md`](docs/modernization-plan.md).
 
 ## Workspace
 

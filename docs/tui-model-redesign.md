@@ -1,5 +1,9 @@
 # TUI Model Redesign
 
+> Historical design note: the project has since migrated to `ratatui` and implemented the
+> committed-transcript/live-tail split. Keep this document as design history; use
+> [`modernization-plan.md`](modernization-plan.md) for current priorities.
+
 This note defines the next TUI model for `miniature-agent`.
 
 The current TUI is usable, but its rendering model is still too close to a
