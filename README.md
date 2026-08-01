@@ -182,6 +182,12 @@ only in a workspace and account you are comfortable allowing the model to modify
 - `miniature-agent --print-paths`
 - `miniature-agent --provider <name> --prompt "hello"`
 
+The minimum supported Rust version is 1.88. CI runs the locked dependency graph on Ubuntu 24.04
+x86_64, Intel macOS, and Apple Silicon macOS. The command runner intentionally depends on POSIX
+process-group behavior, so Windows is not currently supported. See
+[`docs/platform-support.md`](docs/platform-support.md) for the support policy and platform-specific
+details.
+
 Before tagging a release, follow [`docs/v1-release-checklist.md`](docs/v1-release-checklist.md).
 For the current project direction and non-goals, see [`docs/project-scope.md`](docs/project-scope.md).
 For the modernization priorities and release sequence, see
