@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, create_dir_all, read_dir};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::{cmp, fmt::Write as _};
 
-use agent_model::{LlmMessage, LlmRole, MessagePart, TextPart};
 use agent_core::{AgentEvent, AgentMessage, AgentRunResult};
+use agent_model::{LlmMessage, LlmRole, MessagePart, TextPart};
 use anyhow::Context;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -195,30 +195,92 @@ impl SessionStore {
 
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let path = path.into();
-        let file = File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
-        let reader = BufReader::new(file);
+        let file =
+            File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        let mut reader = BufReader::new(file);
 
         let mut entries = Vec::new();
         let mut header = None;
         let mut leaf_id = None;
+        let mut seen_ids = HashSet::new();
+        let mut line_number = 0usize;
+        let mut line = String::new();
+        let mut valid_bytes = 0u64;
+        let mut torn_tail = false;
 
-        for line in reader.lines() {
-            let line = line?;
+        loop {
+            line.clear();
+            let bytes_read = reader.read_line(&mut line)?;
+            if bytes_read == 0 {
+                break;
+            }
+            line_number += 1;
             if line.trim().is_empty() {
+                valid_bytes += bytes_read as u64;
                 continue;
             }
 
-            let entry: FileEntry = serde_json::from_str(&line)
-                .with_context(|| format!("failed to parse session line in {}", path.display()))?;
+            let entry: FileEntry = match serde_json::from_str(&line) {
+                Ok(entry) => entry,
+                Err(_) if !line.ends_with('\n') => {
+                    // A process can be interrupted between writing JSON and its terminating
+                    // newline. Preserve every complete entry and remove only that torn tail so
+                    // future appends cannot become part of the same corrupt record.
+                    torn_tail = true;
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to parse session line {line_number} in {}",
+                            path.display()
+                        )
+                    });
+                }
+            };
 
             match &entry {
-                FileEntry::Header(found) => header = Some(found.clone()),
-                FileEntry::Message(message) => leaf_id = Some(message.base.id.clone()),
-                FileEntry::Event(event) => leaf_id = Some(event.base.id.clone()),
-                FileEntry::Summary(summary) => leaf_id = Some(summary.base.id.clone()),
+                FileEntry::Header(found) => {
+                    anyhow::ensure!(header.is_none(), "session file has more than one header");
+                    anyhow::ensure!(entries.is_empty(), "session header must be the first entry");
+                    anyhow::ensure!(
+                        found.version == CURRENT_SESSION_VERSION,
+                        "unsupported session version {} (expected {})",
+                        found.version,
+                        CURRENT_SESSION_VERSION
+                    );
+                    header = Some(found.clone());
+                }
+                FileEntry::Message(message) => {
+                    validate_entry_base(&message.base, header.as_ref(), &mut seen_ids)?;
+                    leaf_id = Some(message.base.id.clone());
+                }
+                FileEntry::Event(event) => {
+                    validate_entry_base(&event.base, header.as_ref(), &mut seen_ids)?;
+                    leaf_id = Some(event.base.id.clone());
+                }
+                FileEntry::Summary(summary) => {
+                    validate_entry_base(&summary.base, header.as_ref(), &mut seen_ids)?;
+                    leaf_id = Some(summary.base.id.clone());
+                }
             }
 
             entries.push(entry);
+            valid_bytes += bytes_read as u64;
+        }
+
+        if torn_tail {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .with_context(|| {
+                    format!("failed to repair torn session tail in {}", path.display())
+                })?;
+            file.set_len(valid_bytes).with_context(|| {
+                format!("failed to truncate torn session tail in {}", path.display())
+            })?;
+            file.sync_data()
+                .with_context(|| format!("failed to sync repaired session {}", path.display()))?;
         }
 
         Ok(Self {
@@ -261,10 +323,15 @@ impl SessionStore {
             provider,
         )?;
 
-        for entry in &self.entries {
-            match entry {
-                FileEntry::Header(_) => {}
-                FileEntry::Message(message) => {
+        let by_id = self.entry_index();
+        let lineage = self
+            .leaf_id()
+            .map(|leaf_id| self.lineage_ids(leaf_id, &by_id))
+            .unwrap_or_default();
+
+        for id in lineage {
+            match by_id.get(&id) {
+                Some(EntryRef::Message(message)) => {
                     let cloned = MessageEntry {
                         base: forked.next_base(),
                         r#type: "message".to_string(),
@@ -272,7 +339,7 @@ impl SessionStore {
                     };
                     forked.append_entry(FileEntry::Message(cloned))?;
                 }
-                FileEntry::Event(event) => {
+                Some(EntryRef::Event(event)) => {
                     let cloned = EventEntry {
                         base: forked.next_base(),
                         r#type: "event".to_string(),
@@ -280,7 +347,7 @@ impl SessionStore {
                     };
                     forked.append_entry(FileEntry::Event(cloned))?;
                 }
-                FileEntry::Summary(summary) => {
+                Some(EntryRef::Summary(summary)) => {
                     let cloned = SummaryEntry {
                         base: forked.next_base(),
                         r#type: "summary".to_string(),
@@ -290,6 +357,7 @@ impl SessionStore {
                     };
                     forked.append_entry(FileEntry::Summary(cloned))?;
                 }
+                None => {}
             }
         }
 
@@ -325,6 +393,17 @@ impl SessionStore {
     pub fn checkpoints(&self) -> Vec<SessionCheckpoint> {
         let by_id = self.entry_index();
         let depth_by_id = self.depth_by_id(&by_id);
+        let active_checkpoint_id = self.leaf_id().and_then(|leaf_id| {
+            self.lineage_ids(leaf_id, &by_id)
+                .into_iter()
+                .rev()
+                .find(|id| {
+                    matches!(
+                        by_id.get(id),
+                        Some(EntryRef::Message(_) | EntryRef::Summary(_))
+                    )
+                })
+        });
 
         self.entries
             .iter()
@@ -335,7 +414,8 @@ impl SessionStore {
                     timestamp: message.base.timestamp.clone(),
                     label: checkpoint_label(&message.message),
                     depth: depth_by_id.get(&message.base.id).copied().unwrap_or(0),
-                    is_current_leaf: self.leaf_id.as_deref() == Some(message.base.id.as_str()),
+                    is_current_leaf: active_checkpoint_id.as_deref()
+                        == Some(message.base.id.as_str()),
                 }),
                 FileEntry::Summary(summary) => Some(SessionCheckpoint {
                     entry_id: summary.base.id.clone(),
@@ -343,7 +423,8 @@ impl SessionStore {
                     timestamp: summary.base.timestamp.clone(),
                     label: summary_label(summary),
                     depth: depth_by_id.get(&summary.base.id).copied().unwrap_or(0),
-                    is_current_leaf: self.leaf_id.as_deref() == Some(summary.base.id.as_str()),
+                    is_current_leaf: active_checkpoint_id.as_deref()
+                        == Some(summary.base.id.as_str()),
                 }),
                 FileEntry::Header(_) | FileEntry::Event(_) => None,
             })
@@ -621,8 +702,12 @@ impl SessionStore {
     fn lineage_ids(&self, leaf_id: &str, by_id: &HashMap<String, EntryRef<'_>>) -> Vec<String> {
         let mut lineage = Vec::new();
         let mut current = Some(leaf_id.to_string());
+        let mut visited = HashSet::new();
 
         while let Some(id) = current {
+            if !visited.insert(id.clone()) {
+                break;
+            }
             let Some(entry) = by_id.get(&id) else {
                 break;
             };
@@ -640,9 +725,13 @@ impl SessionStore {
         for entry in &self.entries {
             let (id, parent_id) = match entry {
                 FileEntry::Header(_) => continue,
-                FileEntry::Message(message) => (&message.base.id, message.base.parent_id.as_deref()),
+                FileEntry::Message(message) => {
+                    (&message.base.id, message.base.parent_id.as_deref())
+                }
                 FileEntry::Event(event) => (&event.base.id, event.base.parent_id.as_deref()),
-                FileEntry::Summary(summary) => (&summary.base.id, summary.base.parent_id.as_deref()),
+                FileEntry::Summary(summary) => {
+                    (&summary.base.id, summary.base.parent_id.as_deref())
+                }
             };
 
             let parent_depth = parent_id
@@ -661,7 +750,30 @@ impl SessionStore {
 }
 
 fn short_id() -> String {
-    Uuid::new_v4().to_string()[..8].to_string()
+    Uuid::new_v4().simple().to_string()[..16].to_string()
+}
+
+fn validate_entry_base(
+    base: &SessionEntryBase,
+    header: Option<&SessionHeader>,
+    seen_ids: &mut HashSet<String>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(header.is_some(), "session entry appears before the header");
+    anyhow::ensure!(!base.id.is_empty(), "session entry has an empty id");
+    if let Some(parent_id) = &base.parent_id {
+        anyhow::ensure!(
+            seen_ids.contains(parent_id),
+            "session entry {} references missing parent {}",
+            base.id,
+            parent_id
+        );
+    }
+    anyhow::ensure!(
+        seen_ids.insert(base.id.clone()),
+        "duplicate session entry id: {}",
+        base.id
+    );
+    Ok(())
 }
 
 fn now_timestamp() -> String {
@@ -692,9 +804,7 @@ fn synthetic_summary_message(summary: &SummaryEntry) -> AgentMessage {
         parts: vec![MessagePart::Text(TextPart {
             text: format!(
                 "[{}] {} messages compacted.\n{}",
-                DEFAULT_SUMMARY_ROLE,
-                summary.compacted_message_count,
-                summary.summary
+                DEFAULT_SUMMARY_ROLE, summary.compacted_message_count, summary.summary
             ),
         })],
     })
@@ -709,20 +819,17 @@ fn checkpoint_label(message: &AgentMessage) -> String {
     };
 
     let mut summary = String::new();
-    for part in &llm.parts {
+    if let Some(part) = llm.parts.first() {
         match part {
             MessagePart::Text(text) => {
                 let snippet = text.text.replace('\n', " ");
                 let _ = write!(summary, "{snippet}");
-                break;
             }
             MessagePart::ToolCall(call) => {
                 let _ = write!(summary, "tool_call {}", call.name);
-                break;
             }
             MessagePart::ToolResult(result) => {
                 let _ = write!(summary, "tool_result {}", result.call_id);
-                break;
             }
         }
     }
@@ -733,7 +840,10 @@ fn checkpoint_label(message: &AgentMessage) -> String {
 
 fn summary_label(summary: &SummaryEntry) -> String {
     let prefix = truncate_label(&summary.summary.replace('\n', " "), 160);
-    format!("Summary: {} compacted ({prefix})", summary.compacted_message_count)
+    format!(
+        "Summary: {} compacted ({prefix})",
+        summary.compacted_message_count
+    )
 }
 
 fn truncate_label(input: &str, max_chars: usize) -> String {
@@ -742,10 +852,10 @@ fn truncate_label(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
 
-        let keep = cmp::max(0, max_chars.saturating_sub(3));
-        let mut out = chars.into_iter().take(keep).collect::<String>();
-        out.push_str("...");
-        out
+    let keep = cmp::max(0, max_chars.saturating_sub(3));
+    let mut out = chars.into_iter().take(keep).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn build_compaction_summary(messages: impl Iterator<Item = AgentMessage>) -> String {
@@ -790,7 +900,10 @@ fn build_compaction_summary(messages: impl Iterator<Item = AgentMessage>) -> Str
             body.push_str("(empty)");
         }
 
-        lines.push(format!("- {role}: {}", truncate_label(&body.replace('\n', " "), 160)));
+        lines.push(format!(
+            "- {role}: {}",
+            truncate_label(&body.replace('\n', " "), 160)
+        ));
     }
 
     if lines.is_empty() {
@@ -873,6 +986,79 @@ mod tests {
     }
 
     #[test]
+    fn fork_copies_only_the_selected_branch() {
+        let session_dir = temp_session_dir();
+        let mut store = SessionStore::create(&session_dir, "/workspace", None, None).unwrap();
+        store
+            .append_run(&AgentRunResult {
+                new_messages: vec![
+                    text_message(LlmRole::User, "root"),
+                    text_message(LlmRole::Assistant, "original branch"),
+                ],
+                ..AgentRunResult::default()
+            })
+            .unwrap();
+        let root_id = store.checkpoints()[0].entry_id.clone();
+        store.set_leaf(Some(root_id));
+        store
+            .append_run(&AgentRunResult {
+                new_messages: vec![text_message(LlmRole::Assistant, "selected branch")],
+                ..AgentRunResult::default()
+            })
+            .unwrap();
+
+        let forked = store.fork(&session_dir).unwrap();
+        assert_eq!(forked.messages(), store.messages());
+        assert_eq!(forked.messages().len(), 2);
+        assert!(!format!("{:?}", forked.messages()).contains("original branch"));
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn open_ignores_only_an_interrupted_trailing_record() {
+        let session_dir = temp_session_dir();
+        let store = SessionStore::create(&session_dir, "/workspace", None, None).unwrap();
+        let mut file = OpenOptions::new().append(true).open(store.path()).unwrap();
+        file.write_all(br#"{"type":"message""#).unwrap();
+        file.flush().unwrap();
+
+        let torn_len = fs::metadata(store.path()).unwrap().len();
+        let mut reopened = SessionStore::open(store.path()).unwrap();
+        assert_eq!(reopened.header().id, store.header().id);
+        assert!(reopened.messages().is_empty());
+        assert!(fs::metadata(store.path()).unwrap().len() < torn_len);
+
+        reopened
+            .append_run(&AgentRunResult {
+                new_messages: vec![text_message(LlmRole::User, "after recovery")],
+                ..AgentRunResult::default()
+            })
+            .unwrap();
+        let reopened_again = SessionStore::open(store.path()).unwrap();
+        assert_eq!(reopened_again.messages().len(), 1);
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn open_rejects_corruption_in_a_complete_record() {
+        let session_dir = temp_session_dir();
+        let store = SessionStore::create(&session_dir, "/workspace", None, None).unwrap();
+        let mut file = OpenOptions::new().append(true).open(store.path()).unwrap();
+        file.write_all(b"{not json}\n").unwrap();
+        file.flush().unwrap();
+
+        let error = match SessionStore::open(store.path()) {
+            Ok(_) => panic!("complete corrupt record should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("failed to parse session line 2"));
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
     fn compaction_inserts_summary_and_preserves_recent_messages() {
         let session_dir = temp_session_dir();
         let mut store = SessionStore::create(&session_dir, "/workspace", None, None).unwrap();
@@ -949,6 +1135,25 @@ mod tests {
         let sessions = SessionStore::list_sessions(&session_dir).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, valid.header().id);
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn checkpoints_mark_latest_message_when_event_is_the_physical_leaf() {
+        let session_dir = temp_session_dir();
+        let mut store = SessionStore::create(&session_dir, "/workspace", None, None).unwrap();
+        store
+            .append_run(&AgentRunResult {
+                new_messages: vec![text_message(LlmRole::User, "hello")],
+                events: vec![AgentEvent::AgentEnd],
+                stop_reason: Some(agent_model::StopReason::EndTurn),
+            })
+            .unwrap();
+
+        let checkpoints = store.checkpoints();
+        assert_eq!(checkpoints.len(), 1);
+        assert!(checkpoints[0].is_current_leaf);
 
         let _ = fs::remove_dir_all(session_dir);
     }
