@@ -12,7 +12,7 @@ jobs:
     name: Quality checks
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust components
         run: rustup component add rustfmt clippy
       - name: Check formatting
@@ -24,7 +24,7 @@ jobs:
     name: Rust 1.88 compatibility
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Check minimum supported Rust
@@ -44,6 +44,6 @@ jobs:
             os: macos-15
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Test
         run: cargo test --workspace --locked
