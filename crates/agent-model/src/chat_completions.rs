@@ -50,11 +50,20 @@ impl ChatCompletionsBackend {
     }
 
     pub fn build_request_body(&self, request: &ModelRequest) -> serde_json::Value {
-        let messages = request
-            .messages
-            .iter()
-            .map(|message| chat_message_from_llm(message, &self.compat))
-            .collect::<Vec<_>>();
+        let mut tool_names_by_call_id = HashMap::new();
+        let mut messages = Vec::with_capacity(request.messages.len());
+        for message in &request.messages {
+            messages.push(chat_message_from_llm(
+                message,
+                &self.compat,
+                &tool_names_by_call_id,
+            ));
+            for part in &message.parts {
+                if let MessagePart::ToolCall(call) = part {
+                    tool_names_by_call_id.insert(call.call_id.clone(), call.name.clone());
+                }
+            }
+        }
 
         let tools = request
             .tools
@@ -83,7 +92,10 @@ impl ChatCompletionsBackend {
             } else {
                 "system"
             };
-            if let Some(array) = body.get_mut("messages").and_then(serde_json::Value::as_array_mut) {
+            if let Some(array) = body
+                .get_mut("messages")
+                .and_then(serde_json::Value::as_array_mut)
+            {
                 array.insert(
                     0,
                     serde_json::json!({
@@ -216,8 +228,15 @@ struct StreamingToolCall {
 #[derive(Debug)]
 enum ChatCompletionsEvent {
     TextDelta(String),
-    ToolCallStart { index: u64, id: String, name: String },
-    ToolCallArgsDelta { index: u64, delta: String },
+    ToolCallStart {
+        index: u64,
+        id: String,
+        name: String,
+    },
+    ToolCallArgsDelta {
+        index: u64,
+        delta: String,
+    },
     StopReason(StopReason),
     Done,
     Error(String),
@@ -227,6 +246,7 @@ enum ChatCompletionsEvent {
 fn chat_message_from_llm(
     message: &crate::LlmMessage,
     compat: &ChatCompletionsCompat,
+    tool_names_by_call_id: &HashMap<String, String>,
 ) -> serde_json::Value {
     match message.role {
         LlmRole::System => serde_json::json!({
@@ -281,7 +301,12 @@ fn chat_message_from_llm(
                     "content": result.content,
                 });
                 if compat.requires_tool_result_name {
-                    value["name"] = serde_json::Value::String("tool".to_string());
+                    value["name"] = serde_json::Value::String(
+                        tool_names_by_call_id
+                            .get(&result.call_id)
+                            .cloned()
+                            .unwrap_or_else(|| "tool".to_string()),
+                    );
                 }
                 value
             } else {
@@ -295,7 +320,8 @@ fn chat_message_from_llm(
 }
 
 fn flatten_text_parts(parts: &[MessagePart]) -> String {
-    parts.iter()
+    parts
+        .iter()
         .filter_map(|part| match part {
             MessagePart::Text(text) => Some(text.text.as_str()),
             MessagePart::ToolCall(_) | MessagePart::ToolResult(_) => None,
@@ -360,26 +386,33 @@ fn parse_sse_data(
 
     let mut events = Vec::new();
 
-    if let Some(reason) = choice.get("finish_reason").and_then(serde_json::Value::as_str) {
+    if let Some(reason) = choice
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+    {
         events.push(ChatCompletionsEvent::StopReason(map_stop_reason(reason)));
     }
 
     let delta = choice.get("delta").cloned().unwrap_or_default();
-    if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str) {
-        if !text.is_empty() {
-            events.push(ChatCompletionsEvent::TextDelta(text.to_string()));
-        }
+    if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
+        && !text.is_empty()
+    {
+        events.push(ChatCompletionsEvent::TextDelta(text.to_string()));
     }
 
-    if let Some(reasoning_field) = compat.reasoning_field.as_deref() {
-        if let Some(reasoning) = delta.get(reasoning_field).and_then(serde_json::Value::as_str) {
-            if !reasoning.is_empty() {
-                events.push(ChatCompletionsEvent::TextDelta(reasoning.to_string()));
-            }
-        }
+    if let Some(reasoning_field) = compat.reasoning_field.as_deref()
+        && let Some(reasoning) = delta
+            .get(reasoning_field)
+            .and_then(serde_json::Value::as_str)
+        && !reasoning.is_empty()
+    {
+        events.push(ChatCompletionsEvent::TextDelta(reasoning.to_string()));
     }
 
-    if let Some(tool_calls) = delta.get("tool_calls").and_then(serde_json::Value::as_array) {
+    if let Some(tool_calls) = delta
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+    {
         for tool_call in tool_calls {
             let index = tool_call
                 .get("index")
@@ -429,7 +462,7 @@ fn map_stop_reason(reason: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmMessage, MessagePart, ModelRequest, TextPart, ToolResultPart};
+    use crate::{LlmMessage, MessagePart, ModelRequest, TextPart, ToolCallPart, ToolResultPart};
     use secrecy::SecretString;
 
     fn sample_request() -> ModelRequest {
@@ -440,6 +473,15 @@ mod tests {
                     role: LlmRole::User,
                     parts: vec![MessagePart::Text(TextPart {
                         text: "hello".to_string(),
+                    })],
+                },
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    parts: vec![MessagePart::ToolCall(ToolCallPart {
+                        id: "call_1".to_string(),
+                        call_id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
                     })],
                 },
                 LlmMessage {
@@ -460,20 +502,28 @@ mod tests {
 
     #[test]
     fn request_body_uses_developer_role_when_supported() {
-        let backend = ChatCompletionsBackend::new("compatible").with_compat(ChatCompletionsCompat {
-            supports_reasoning_effort: true,
-            supports_developer_role: true,
-            requires_tool_result_name: false,
-            reasoning_field: Some("reasoning".to_string()),
-        });
+        let backend =
+            ChatCompletionsBackend::new("compatible").with_compat(ChatCompletionsCompat {
+                supports_reasoning_effort: true,
+                supports_developer_role: true,
+                requires_tool_result_name: false,
+                reasoning_field: Some("reasoning".to_string()),
+            });
 
         let body = backend.build_request_body(&sample_request());
         let messages = body
             .get("messages")
             .and_then(serde_json::Value::as_array)
             .expect("messages array");
-        assert_eq!(messages[0].get("role").and_then(serde_json::Value::as_str), Some("developer"));
-        assert_eq!(body.get("reasoning_effort").and_then(serde_json::Value::as_str), Some("medium"));
+        assert_eq!(
+            messages[0].get("role").and_then(serde_json::Value::as_str),
+            Some("developer")
+        );
+        assert_eq!(
+            body.get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("medium")
+        );
     }
 
     #[test]
@@ -491,8 +541,14 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .expect("messages array");
         let tool_message = messages.last().expect("tool message");
-        assert_eq!(tool_message.get("role").and_then(serde_json::Value::as_str), Some("tool"));
-        assert_eq!(tool_message.get("name").and_then(serde_json::Value::as_str), Some("tool"));
+        assert_eq!(
+            tool_message.get("role").and_then(serde_json::Value::as_str),
+            Some("tool")
+        );
+        assert_eq!(
+            tool_message.get("name").and_then(serde_json::Value::as_str),
+            Some("read")
+        );
     }
 
     #[test]
@@ -511,7 +567,8 @@ mod tests {
 
     #[test]
     fn parser_handles_reasoning_field() {
-        let frame = r#"data: {"choices":[{"delta":{"reasoning":"thinking"},"finish_reason":null}]}"#;
+        let frame =
+            r#"data: {"choices":[{"delta":{"reasoning":"thinking"},"finish_reason":null}]}"#;
         let event = parse_sse_data(
             frame,
             &ChatCompletionsCompat {
@@ -726,8 +783,8 @@ mod tests {
     #[test]
     fn multi_tool_calls_fixture_emits_all_tool_call_events() {
         let frame = read_fixture("multi_tool_calls.sse");
-        let events = parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default())
-            .expect("parse ok");
+        let events =
+            parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default()).expect("parse ok");
 
         assert_eq!(events.len(), 4);
         match &events[0] {
@@ -759,8 +816,8 @@ mod tests {
     #[test]
     fn finish_reason_fixture_maps_to_tool_calls() {
         let frame = read_fixture("tool_calls_finish_reason.sse");
-        let events = parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default())
-            .expect("parse ok");
+        let events =
+            parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default()).expect("parse ok");
         assert_eq!(events.len(), 1);
         match &events[0] {
             ChatCompletionsEvent::StopReason(reason) => assert_eq!(*reason, StopReason::ToolCalls),
@@ -771,8 +828,8 @@ mod tests {
     #[test]
     fn done_fixture_maps_to_done_event() {
         let frame = read_fixture("done.sse");
-        let events = parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default())
-            .expect("parse ok");
+        let events =
+            parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default()).expect("parse ok");
         assert_eq!(events.len(), 1);
         match &events[0] {
             ChatCompletionsEvent::Done => {}
@@ -783,8 +840,8 @@ mod tests {
     #[test]
     fn error_fixture_maps_to_error_event() {
         let frame = read_fixture("error.sse");
-        let events = parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default())
-            .expect("parse ok");
+        let events =
+            parse_sse_data(frame.trim_end(), &ChatCompletionsCompat::default()).expect("parse ok");
         assert_eq!(events.len(), 1);
         match &events[0] {
             ChatCompletionsEvent::Error(message) => {

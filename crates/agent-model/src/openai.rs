@@ -7,7 +7,10 @@ use futures::StreamExt;
 use reqwest::Client;
 use secrecy::ExposeSecret;
 
-use crate::{Backend, Capability, LlmRole, MessagePart, ModelEvent, ModelEventStream, ModelRequest, StopReason};
+use crate::{
+    Backend, Capability, LlmRole, MessagePart, ModelEvent, ModelEventStream, ModelRequest,
+    StopReason,
+};
 
 const RESPONSES_API_URL: &str = "https://api.openai.com/v1/responses";
 
@@ -37,18 +40,20 @@ impl OpenAiBackend {
     }
 
     pub fn build_request_body(&self, request: &ModelRequest) -> serde_json::Value {
-        let input = request
-            .messages
-            .iter()
-            .filter_map(|message| match message.role {
-                LlmRole::Tool => message.parts.iter().find_map(|part| match part {
-                    MessagePart::ToolResult(result) => Some(serde_json::json!({
-                        "type": "function_call_output",
-                        "call_id": result.call_id,
-                        "output": result.content,
-                    })),
-                    _ => None,
-                }),
+        let mut input = Vec::new();
+        for message in &request.messages {
+            match message.role {
+                LlmRole::Tool => {
+                    for part in &message.parts {
+                        if let MessagePart::ToolResult(result) = part {
+                            input.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": result.call_id,
+                                "output": result.content,
+                            }));
+                        }
+                    }
+                }
                 LlmRole::System | LlmRole::User | LlmRole::Assistant => {
                     let role = match message.role {
                         LlmRole::System => "system",
@@ -56,7 +61,6 @@ impl OpenAiBackend {
                         LlmRole::Assistant => "assistant",
                         LlmRole::Tool => unreachable!(),
                     };
-
                     let content = message
                         .parts
                         .iter()
@@ -73,13 +77,28 @@ impl OpenAiBackend {
                         })
                         .collect::<Vec<_>>();
 
-                    Some(serde_json::json!({
-                        "role": role,
-                        "content": content,
-                    }))
+                    if !content.is_empty() {
+                        input.push(serde_json::json!({
+                            "role": role,
+                            "content": content,
+                        }));
+                    }
+
+                    if matches!(message.role, LlmRole::Assistant) {
+                        for part in &message.parts {
+                            if let MessagePart::ToolCall(call) = part {
+                                input.push(serde_json::json!({
+                                    "type": "function_call",
+                                    "call_id": call.call_id,
+                                    "name": call.name,
+                                    "arguments": call.arguments_json,
+                                }));
+                            }
+                        }
+                    }
                 }
-            })
-            .collect::<Vec<_>>();
+            }
+        }
 
         let tools = request
             .tools
@@ -99,6 +118,7 @@ impl OpenAiBackend {
             "input": input,
             "tools": tools,
             "stream": true,
+            "store": false,
         });
 
         if !request.system.is_empty() {
@@ -176,14 +196,33 @@ impl Backend for OpenAiBackend {
 
 #[derive(Debug)]
 enum OpenAiSseEvent {
-    OutputTextDelta { delta: String },
-    OutputItemAdded { item_id: String, call_id: String, name: String },
-    FunctionCallArgumentsDelta { item_id: String, delta: String },
-    FunctionCallArgumentsDone { item_id: String, arguments: String },
-    OutputItemDone { item_id: String, call_id: Option<String> },
+    OutputTextDelta {
+        delta: String,
+    },
+    OutputItemAdded {
+        item_id: String,
+        call_id: String,
+        name: String,
+    },
+    FunctionCallArgumentsDelta {
+        item_id: String,
+        delta: String,
+    },
+    FunctionCallArgumentsDone {
+        item_id: String,
+        arguments: String,
+    },
+    OutputItemDone {
+        item_id: String,
+        call_id: Option<String>,
+    },
     Completed,
-    Failed { message: String },
-    Error { message: String },
+    Failed {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
     Ignored,
 }
 
@@ -198,7 +237,11 @@ impl OpenAiStreamState {
     fn translate(&mut self, event: OpenAiSseEvent) -> Vec<ModelEvent> {
         match event {
             OpenAiSseEvent::OutputTextDelta { delta } => vec![ModelEvent::TextDelta(delta)],
-            OpenAiSseEvent::OutputItemAdded { item_id, call_id, name } => {
+            OpenAiSseEvent::OutputItemAdded {
+                item_id,
+                call_id,
+                name,
+            } => {
                 if call_id.is_empty() {
                     Vec::new()
                 } else {
@@ -397,7 +440,7 @@ fn parse_sse_data(frame: &str) -> anyhow::Result<Option<OpenAiSseEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmMessage, TextPart, ToolResultPart};
+    use crate::{LlmMessage, TextPart, ToolCallPart, ToolResultPart};
     use secrecy::SecretString;
 
     fn request_with_messages(messages: Vec<LlmMessage>) -> ModelRequest {
@@ -439,6 +482,39 @@ mod tests {
         assert_eq!(body["instructions"], "system");
         let temperature = body["temperature"].as_f64().unwrap();
         assert!((temperature - 0.2).abs() < 0.000_001);
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn build_request_body_preserves_assistant_function_calls() {
+        let backend = OpenAiBackend::new();
+        let body = backend.build_request_body(&request_with_messages(vec![
+            LlmMessage {
+                role: LlmRole::Assistant,
+                parts: vec![MessagePart::ToolCall(ToolCallPart {
+                    id: "item-1".to_string(),
+                    call_id: "call-1".to_string(),
+                    name: "read".to_string(),
+                    arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
+                })],
+            },
+            LlmMessage {
+                role: LlmRole::Tool,
+                parts: vec![MessagePart::ToolResult(ToolResultPart {
+                    call_id: "call-1".to_string(),
+                    content: "workspace manifest".to_string(),
+                    is_error: false,
+                })],
+            },
+        ]));
+
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call-1");
+        assert_eq!(input[0]["name"], "read");
+        assert_eq!(input[0]["arguments"], r#"{"path":"Cargo.toml"}"#);
+        assert_eq!(input[1]["type"], "function_call_output");
     }
 
     #[test]

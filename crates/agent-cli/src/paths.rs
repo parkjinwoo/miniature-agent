@@ -14,7 +14,11 @@ impl AppPaths {
     pub fn discover() -> anyhow::Result<Self> {
         let config_file = std::env::var_os("MINIATURE_AGENT_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or_else(|| xdg_config_home().join("miniature-agent").join("config.toml"));
+            .unwrap_or_else(|| {
+                xdg_config_home()
+                    .join("miniature-agent")
+                    .join("config.toml")
+            });
         let config_dir = config_file
             .parent()
             .map(PathBuf::from)

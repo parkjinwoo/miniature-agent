@@ -53,8 +53,11 @@ pub(crate) fn move_cursor_vertical_by_display_rows(
         row.saturating_add(direction as usize)
     };
 
-    cursor_for_wrapped_row_col(&positions, target_row, col)
-        .unwrap_or_else(|| if direction < 0 { 0 } else { chars.len() })
+    cursor_for_wrapped_row_col(&positions, target_row, col).unwrap_or(if direction < 0 {
+        0
+    } else {
+        chars.len()
+    })
 }
 
 pub(crate) fn wrap_line_by_display_width(line: &str, width: usize) -> Vec<String> {

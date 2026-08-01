@@ -34,14 +34,10 @@ pub(crate) async fn compact_session<B: Backend>(
         return Ok(None);
     }
 
-    let summary = summarize_messages_for_compaction(
-        backend,
-        api_key,
-        summary_model,
-        &compactable_messages,
-    )
-    .await
-    .unwrap_or_else(|_| summarize_messages_locally(&compactable_messages));
+    let summary =
+        summarize_messages_for_compaction(backend, api_key, summary_model, &compactable_messages)
+            .await
+            .unwrap_or_else(|_| summarize_messages_locally(&compactable_messages));
     session.compact_leaf_with_summary(keep_last, summary)
 }
 

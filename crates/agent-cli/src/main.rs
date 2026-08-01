@@ -22,6 +22,11 @@ mod tests {
         mismatch_summary_inline, mismatch_summary_lines, prioritize_matching_sessions,
         session_matches_provider,
     };
+    use crate::app::{fork_for_non_interactive_provider_mismatch, infer_default_provider};
+    use crate::args::{parse_model, parse_prompt, parse_provider};
+    use crate::compaction::compact_session;
+    use crate::config::AppConfig;
+    use crate::provider_registry::{BackendSpec, Provider, ProviderSpec};
     use agent_model::{
         Backend, Capability, LlmMessage, LlmRole, MessagePart, ModelEvent, ModelEventStream,
         ModelRequest, StopReason, TextPart,
@@ -29,13 +34,6 @@ mod tests {
     use agent_session::SessionStore;
     use async_trait::async_trait;
     use futures::stream;
-    use crate::args::{
-        parse_model, parse_prompt, parse_provider,
-    };
-    use crate::app::infer_default_provider;
-    use crate::compaction::compact_session;
-    use crate::config::AppConfig;
-    use crate::provider_registry::{BackendSpec, Provider, ProviderSpec};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -54,10 +52,7 @@ mod tests {
             true
         }
 
-        async fn stream(
-            &self,
-            _request: ModelRequest,
-        ) -> anyhow::Result<ModelEventStream> {
+        async fn stream(&self, _request: ModelRequest) -> anyhow::Result<ModelEventStream> {
             let events = self.events.lock().unwrap().clone();
             Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
         }
@@ -140,6 +135,39 @@ mod tests {
     }
 
     #[test]
+    fn non_interactive_provider_mismatch_forks_before_running() {
+        let session_dir = temp_session_dir();
+        let mut session = SessionStore::create(
+            &session_dir,
+            "/workspace",
+            None,
+            Some(openai_spec().to_session_info()),
+        )
+        .unwrap();
+        let compatible = Provider::Compatible
+            .load_spec(&AppConfig::default())
+            .unwrap();
+
+        let original_id = session.header().id.clone();
+        let forked =
+            fork_for_non_interactive_provider_mismatch(&mut session, &session_dir, &compatible)
+                .unwrap();
+
+        assert!(forked);
+        assert_ne!(session.header().id, original_id);
+        assert_eq!(
+            session.header().parent_session.as_deref(),
+            Some(original_id.as_str())
+        );
+        assert_eq!(
+            session.header().provider.as_ref().unwrap().display_name,
+            "Compatible"
+        );
+
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
     fn parse_prompt_reads_cli_flag() {
         let args = vec![
             "agent-cli".to_string(),
@@ -170,13 +198,11 @@ default_model = "local-model"
 
     #[test]
     fn inferred_default_provider_prefers_single_provider_env() {
-        unsafe {
-            std::env::set_var(
-                "MINIATURE_AGENT_COMPATIBLE_API_KEY",
-                "compatible-token",
-            )
-        };
-        assert_eq!(infer_default_provider(&AppConfig::default()), Provider::Compatible);
+        unsafe { std::env::set_var("MINIATURE_AGENT_COMPATIBLE_API_KEY", "compatible-token") };
+        assert_eq!(
+            infer_default_provider(&AppConfig::default()),
+            Provider::Compatible
+        );
         unsafe { std::env::remove_var("MINIATURE_AGENT_COMPATIBLE_API_KEY") };
     }
 
@@ -302,10 +328,16 @@ default_model = "local-model"
             ])),
         };
 
-        compact_session(&mut session, 2, Some("key".to_string()), &backend, "summary-model")
-            .await
-            .unwrap()
-            .unwrap();
+        compact_session(
+            &mut session,
+            2,
+            Some("key".to_string()),
+            &backend,
+            "summary-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let restored = session.messages();
         let first_text = match &restored[0].as_llm_message().parts[0] {
@@ -337,10 +369,16 @@ default_model = "local-model"
             events: Arc::new(Mutex::new(vec![ModelEvent::Error("boom".to_string())])),
         };
 
-        compact_session(&mut session, 2, Some("key".to_string()), &backend, "summary-model")
-            .await
-            .unwrap()
-            .unwrap();
+        compact_session(
+            &mut session,
+            2,
+            Some("key".to_string()),
+            &backend,
+            "summary-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let restored = session.messages();
         let first_text = match &restored[0].as_llm_message().parts[0] {
@@ -375,10 +413,16 @@ default_model = "local-model"
             }])),
         };
 
-        compact_session(&mut session, 2, Some("key".to_string()), &backend, "summary-model")
-            .await
-            .unwrap()
-            .unwrap();
+        compact_session(
+            &mut session,
+            2,
+            Some("key".to_string()),
+            &backend,
+            "summary-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let restored = session.messages();
         let first_text = match &restored[0].as_llm_message().parts[0] {

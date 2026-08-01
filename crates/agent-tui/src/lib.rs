@@ -1261,7 +1261,7 @@ fn selection_preview_lines(state: &TuiState, width: usize, max_rows: usize) -> V
 }
 
 fn live_tool_tail_budget(max_lines: usize) -> usize {
-    max_lines.saturating_sub(1).max(1).min(6)
+    max_lines.saturating_sub(1).clamp(1, 6)
 }
 
 fn ratatui_lines(lines: &[StyledLine], width: usize) -> Vec<Line<'static>> {

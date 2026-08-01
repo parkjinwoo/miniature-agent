@@ -1,5 +1,5 @@
-use agent_model::{LlmMessage, LlmRole, MessagePart, TextPart};
 use agent_core::Agent;
+use agent_model::{LlmMessage, LlmRole, MessagePart, TextPart};
 use agent_session::SessionStore;
 use secrecy::SecretString;
 
@@ -48,8 +48,7 @@ pub(crate) async fn run_prompt(
     {
         println!(
             "[system] auto-compacted {} messages into {}",
-            compaction.compacted_message_count,
-            compaction.summary_entry_id
+            compaction.compacted_message_count, compaction.summary_entry_id
         );
     }
     Ok(())

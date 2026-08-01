@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use agent_model::{
-    Backend, LlmMessage, LlmRole, MessagePart, ModelEvent, ModelRequest, StopReason, ToolResultPart,
-    Usage,
+    Backend, LlmMessage, LlmRole, MessagePart, ModelEvent, ModelRequest, StopReason,
+    ToolResultPart, Usage,
 };
 use agent_tools::{ToolCall, ToolRegistry};
 
@@ -38,17 +38,29 @@ impl AgentMessage {
 pub enum AgentEvent {
     AgentStart,
     TurnStart,
-    MessageStart { role: LlmRole },
+    MessageStart {
+        role: LlmRole,
+    },
     TextDelta(String),
-    ToolCallStart { id: String, name: String },
-    ToolCallArgsDelta { id: String, delta: String },
-    ToolCallEnd { id: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallArgsDelta {
+        id: String,
+        delta: String,
+    },
+    ToolCallEnd {
+        id: String,
+    },
     Usage(Usage),
     MessageEnd {
         message: LlmMessage,
         stop_reason: StopReason,
     },
-    ToolResultReady { message: LlmMessage },
+    ToolResultReady {
+        message: LlmMessage,
+    },
     TurnEnd {
         stop_reason: StopReason,
     },
@@ -60,6 +72,8 @@ pub struct AgentConfig {
     pub system: String,
     pub model: String,
     pub temperature: Option<f32>,
+    /// Maximum number of model turns for one user prompt, including tool rounds.
+    pub max_turns: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -146,15 +160,18 @@ where
         emit_event(
             &mut result,
             AgentEvent::MessageEnd {
-            message: user_message.clone(),
-            stop_reason: StopReason::EndTurn,
-        },
+                message: user_message.clone(),
+                stop_reason: StopReason::EndTurn,
+            },
             &mut on_event,
         );
 
         result.new_messages.push(AgentMessage::User(user_message));
 
+        let max_turns = self.config.max_turns.max(1);
+        let mut turn_count = 0usize;
         loop {
+            turn_count += 1;
             let continuation = self.run_turn(api_key.clone(), &mut on_event).await?;
             let should_continue = matches!(continuation.stop_reason, Some(StopReason::ToolCalls));
             result.stop_reason = continuation.stop_reason.clone();
@@ -162,6 +179,50 @@ where
             result.new_messages.extend(continuation.new_messages);
 
             if !should_continue {
+                break;
+            }
+            if turn_count >= max_turns {
+                let text = format!(
+                    "Agent stopped after {max_turns} model turns to prevent an unbounded tool loop."
+                );
+                let message = LlmMessage {
+                    role: LlmRole::Assistant,
+                    parts: vec![MessagePart::Text(agent_model::TextPart {
+                        text: text.clone(),
+                    })],
+                };
+                self.state
+                    .messages
+                    .push(AgentMessage::Assistant(message.clone()));
+                result
+                    .new_messages
+                    .push(AgentMessage::Assistant(message.clone()));
+                emit_event(&mut result, AgentEvent::TurnStart, &mut on_event);
+                emit_event(
+                    &mut result,
+                    AgentEvent::MessageStart {
+                        role: LlmRole::Assistant,
+                    },
+                    &mut on_event,
+                );
+                emit_event(&mut result, AgentEvent::TextDelta(text), &mut on_event);
+                emit_event(
+                    &mut result,
+                    AgentEvent::MessageEnd {
+                        message,
+                        stop_reason: StopReason::Error,
+                    },
+                    &mut on_event,
+                );
+                emit_event(
+                    &mut result,
+                    AgentEvent::TurnEnd {
+                        stop_reason: StopReason::Error,
+                    },
+                    &mut on_event,
+                );
+                emit_event(&mut result, AgentEvent::AgentEnd, &mut on_event);
+                result.stop_reason = Some(StopReason::Error);
                 break;
             }
         }
@@ -217,10 +278,17 @@ where
                         arguments_json: String::new(),
                     }));
                     tool_args_by_call_id.entry(id.clone()).or_default();
-                    emit_event(&mut result, AgentEvent::ToolCallStart { id, name }, on_event);
+                    emit_event(
+                        &mut result,
+                        AgentEvent::ToolCallStart { id, name },
+                        on_event,
+                    );
                 }
                 ModelEvent::ToolCallArgsDelta { id, delta } => {
-                    tool_args_by_call_id.entry(id.clone()).or_default().push_str(&delta);
+                    tool_args_by_call_id
+                        .entry(id.clone())
+                        .or_default()
+                        .push_str(&delta);
                     emit_event(
                         &mut result,
                         AgentEvent::ToolCallArgsDelta { id, delta },
@@ -228,28 +296,46 @@ where
                     );
                 }
                 ModelEvent::ToolCallEnd { id } => {
-                    if let Some(final_args) = tool_args_by_call_id.get(&id) {
-                        if let Some(MessagePart::ToolCall(tool_call)) = assistant_parts
-                            .iter_mut()
-                            .rev()
-                            .find(|part| matches!(part, MessagePart::ToolCall(call) if call.call_id == id))
-                        {
-                            tool_call.arguments_json = final_args.clone();
-                        }
-                    }
                     emit_event(&mut result, AgentEvent::ToolCallEnd { id }, on_event);
                 }
                 ModelEvent::Usage(usage) => {
                     emit_event(&mut result, AgentEvent::Usage(usage), on_event);
                 }
-                ModelEvent::Completed { stop_reason: reason } => {
-                    stop_reason = reason;
+                ModelEvent::Completed {
+                    stop_reason: reason,
+                } => {
+                    if !matches!(stop_reason, StopReason::Error) {
+                        stop_reason = reason;
+                    }
                 }
                 ModelEvent::Error(message) => {
                     stop_reason = StopReason::Error;
                     push_text_delta(&mut assistant_parts, &format!("Backend error: {message}"));
                 }
             }
+        }
+
+        for part in &mut assistant_parts {
+            if let MessagePart::ToolCall(tool_call) = part
+                && let Some(final_args) = tool_args_by_call_id.get(&tool_call.call_id)
+            {
+                tool_call.arguments_json = final_args.clone();
+            }
+        }
+
+        if matches!(stop_reason, StopReason::ToolCalls)
+            && !assistant_parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::ToolCall(_)))
+        {
+            stop_reason = StopReason::Error;
+            let message = "Backend requested tool continuation without providing a tool call.";
+            push_text_delta(&mut assistant_parts, message);
+            emit_event(
+                &mut result,
+                AgentEvent::TextDelta(message.to_string()),
+                on_event,
+            );
         }
 
         let assistant_message = LlmMessage {
@@ -326,7 +412,11 @@ where
     }
 }
 
-fn emit_event(result: &mut AgentRunResult, event: AgentEvent, on_event: &mut impl FnMut(&AgentEvent)) {
+fn emit_event(
+    result: &mut AgentRunResult,
+    event: AgentEvent,
+    on_event: &mut impl FnMut(&AgentEvent),
+) {
     on_event(&event);
     result.events.push(event);
 }
@@ -451,12 +541,16 @@ mod tests {
                 system: "system".to_string(),
                 model: "test-model".to_string(),
                 temperature: None,
+                max_turns: 8,
             },
             tools,
         );
 
         let run = agent
-            .prompt(user_message("hi"), SecretString::new("key".to_string().into_boxed_str()))
+            .prompt(
+                user_message("hi"),
+                SecretString::new("key".to_string().into_boxed_str()),
+            )
             .await
             .unwrap();
 
@@ -470,7 +564,9 @@ mod tests {
         let state = agent.state();
         assert_eq!(state.messages.len(), 4);
         let tool_result = state.messages[2].as_llm_message();
-        assert!(matches!(&tool_result.parts[0], MessagePart::ToolResult(part) if part.content == "echo:hello"));
+        assert!(
+            matches!(&tool_result.parts[0], MessagePart::ToolResult(part) if part.content == "echo:hello")
+        );
         let final_message = state.messages[3].as_llm_message();
         assert!(matches!(&final_message.parts[0], MessagePart::Text(part) if part.text == "done"));
     }
@@ -494,6 +590,7 @@ mod tests {
                 system: "system".to_string(),
                 model: "test-model".to_string(),
                 temperature: None,
+                max_turns: 8,
             },
             ToolRegistry::new(),
         );
@@ -520,6 +617,103 @@ mod tests {
             event,
             AgentEvent::TurnEnd { stop_reason } if stop_reason == &StopReason::Error
         )));
-        assert!(events.iter().any(|event| matches!(event, AgentEvent::AgentEnd)));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::AgentEnd))
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_stops_unbounded_tool_loops() {
+        let tool_turn = || {
+            vec![
+                ModelEvent::ToolCallStart {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                },
+                ModelEvent::ToolCallArgsDelta {
+                    id: "call-1".to_string(),
+                    delta: r#"{"value":"again"}"#.to_string(),
+                },
+                ModelEvent::ToolCallEnd {
+                    id: "call-1".to_string(),
+                },
+                ModelEvent::Completed {
+                    stop_reason: StopReason::ToolCalls,
+                },
+            ]
+        };
+        let backend = FakeBackend {
+            streams: Arc::new(Mutex::new(VecDeque::from(vec![tool_turn(), tool_turn()]))),
+        };
+        let mut tools = ToolRegistry::new();
+        tools.register(EchoTool);
+        let mut agent = Agent::new(
+            backend,
+            AgentConfig {
+                system: "system".to_string(),
+                model: "test-model".to_string(),
+                temperature: None,
+                max_turns: 2,
+            },
+            tools,
+        );
+
+        let run = agent
+            .prompt(
+                user_message("loop forever"),
+                SecretString::new("key".to_string().into_boxed_str()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(run.stop_reason, Some(StopReason::Error));
+        let last = run.new_messages.last().unwrap().as_llm_message();
+        assert!(matches!(
+            &last.parts[0],
+            MessagePart::Text(part) if part.text.contains("prevent an unbounded tool loop")
+        ));
+        assert!(
+            run.events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::AgentEnd))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_stop_without_a_call_becomes_an_error() {
+        let backend = FakeBackend {
+            streams: Arc::new(Mutex::new(VecDeque::from(vec![vec![
+                ModelEvent::Completed {
+                    stop_reason: StopReason::ToolCalls,
+                },
+            ]]))),
+        };
+        let mut agent = Agent::new(
+            backend,
+            AgentConfig {
+                system: "system".to_string(),
+                model: "test-model".to_string(),
+                temperature: None,
+                max_turns: 8,
+            },
+            ToolRegistry::new(),
+        );
+
+        let run = agent
+            .prompt(
+                user_message("hi"),
+                SecretString::new("key".to_string().into_boxed_str()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(run.stop_reason, Some(StopReason::Error));
+        let assistant = run.new_messages.last().unwrap().as_llm_message();
+        assert!(matches!(
+            &assistant.parts[0],
+            MessagePart::Text(part) if part.text.contains("without providing a tool call")
+        ));
     }
 }

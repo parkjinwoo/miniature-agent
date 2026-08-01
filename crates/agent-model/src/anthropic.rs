@@ -44,7 +44,7 @@ impl AnthropicBackend {
         let messages = request
             .messages
             .iter()
-            .filter_map(|message| anthropic_message_from_llm(message))
+            .filter_map(anthropic_message_from_llm)
             .collect::<Vec<_>>();
 
         let tools = request
@@ -169,13 +169,28 @@ struct ToolUseBlock {
 
 #[derive(Debug)]
 enum AnthropicSseEvent {
-    TextDelta { text: String },
-    ToolUseStart { index: u64, id: String, name: String },
-    InputJsonDelta { index: u64, partial_json: String },
-    ContentBlockStop { index: u64 },
-    MessageDelta { new_stop_reason: StopReason },
+    TextDelta {
+        text: String,
+    },
+    ToolUseStart {
+        index: u64,
+        id: String,
+        name: String,
+    },
+    InputJsonDelta {
+        index: u64,
+        partial_json: String,
+    },
+    ContentBlockStop {
+        index: u64,
+    },
+    MessageDelta {
+        new_stop_reason: StopReason,
+    },
     MessageStop,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Ignored,
 }
 
@@ -386,6 +401,16 @@ fn parse_sse_data(frame: &str) -> anyhow::Result<Option<AnthropicSseEvent>> {
     Ok(Some(event))
 }
 
+fn map_stop_reason(stop_reason: Option<&str>) -> StopReason {
+    match stop_reason.unwrap_or_default() {
+        "tool_use" => StopReason::ToolCalls,
+        "max_tokens" => StopReason::MaxTokens,
+        "pause_turn" => StopReason::Cancelled,
+        "refusal" => StopReason::Error,
+        _ => StopReason::EndTurn,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,17 +543,13 @@ mod tests {
     #[test]
     fn parse_json_object_or_empty_rejects_non_object() {
         assert_eq!(parse_json_object_or_empty(r#"{"a":1}"#)["a"], 1);
-        assert_eq!(parse_json_object_or_empty(r#"[1,2,3]"#), serde_json::json!({}));
-        assert_eq!(parse_json_object_or_empty("not json"), serde_json::json!({}));
-    }
-}
-
-fn map_stop_reason(stop_reason: Option<&str>) -> StopReason {
-    match stop_reason.unwrap_or_default() {
-        "tool_use" => StopReason::ToolCalls,
-        "max_tokens" => StopReason::MaxTokens,
-        "pause_turn" => StopReason::Cancelled,
-        "refusal" => StopReason::Error,
-        _ => StopReason::EndTurn,
+        assert_eq!(
+            parse_json_object_or_empty(r#"[1,2,3]"#),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            parse_json_object_or_empty("not json"),
+            serde_json::json!({})
+        );
     }
 }

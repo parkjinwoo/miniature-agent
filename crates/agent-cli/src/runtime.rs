@@ -1,6 +1,4 @@
-use agent_model::{
-    AnthropicBackend, Backend, ChatCompletionsBackend, OpenAiBackend,
-};
+use agent_model::{AnthropicBackend, Backend, ChatCompletionsBackend, OpenAiBackend};
 
 use crate::provider_registry::{BackendSpec, ProviderSpec};
 

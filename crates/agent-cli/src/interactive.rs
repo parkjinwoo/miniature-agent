@@ -3,20 +3,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_model::{LlmMessage, LlmRole, MessagePart, TextPart};
 use agent_core::Agent;
+use agent_model::{LlmMessage, LlmRole, MessagePart, TextPart};
 use agent_session::{CompactionResult, SessionStore};
 use agent_tui::{PromptAction, RunningAction, TuiApp};
 use secrecy::SecretString;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
+use crate::compaction::{compact_session, maybe_auto_compact};
 use crate::paths::AppPaths;
 use crate::provider_registry::ProviderSpec;
+use crate::runtime::AppBackend;
 use crate::session_ui::{
     SessionSelectionOutcome, format_session_summary_line, resolve_selected_session,
 };
-use crate::compaction::{compact_session, maybe_auto_compact};
-use crate::runtime::AppBackend;
 
 const PROVIDER_MISMATCH_STATUS: &str = "Provider mismatch · /fork recommended";
 
@@ -73,15 +73,7 @@ pub(crate) async fn run_interactive(
 
         tui.push_user_input(&input);
 
-        if try_handle_local_command(
-            &input,
-            session,
-            &agent,
-            &mut tui,
-            &config,
-        )
-        .await?
-        {
+        if try_handle_local_command(&input, session, &agent, &mut tui, &config).await? {
             continue;
         }
 
@@ -125,7 +117,9 @@ pub(crate) async fn run_interactive(
                     Ok(Err(error)) => {
                         let mut guard = agent.lock().await;
                         guard.set_state(snapshot.clone());
-                        tui.push_system_note(format!("run failed; restored previous state: {error}"));
+                        tui.push_system_note(format!(
+                            "run failed; restored previous state: {error}"
+                        ));
                         tui.set_status("Run failed");
                         tui.redraw()?;
                         failed = true;
@@ -134,7 +128,9 @@ pub(crate) async fn run_interactive(
                     Err(error) => {
                         let mut guard = agent.lock().await;
                         guard.set_state(snapshot.clone());
-                        tui.push_system_note(format!("run task failed; restored previous state: {error}"));
+                        tui.push_system_note(format!(
+                            "run task failed; restored previous state: {error}"
+                        ));
                         tui.set_status("Run failed");
                         tui.redraw()?;
                         failed = true;
@@ -244,8 +240,7 @@ async fn try_handle_local_command(
                     .await?;
                     tui.push_system_note(format!(
                         "compacted {} messages into {}",
-                        compaction.compacted_message_count,
-                        compaction.summary_entry_id
+                        compaction.compacted_message_count, compaction.summary_entry_id
                     ));
                 }
                 None => {
@@ -278,46 +273,48 @@ async fn try_handle_local_command(
                     .iter()
                     .position(|summary| summary.path == session.path())
                     .unwrap_or(0);
-                if let Some(index) =
-                    tui.pick_from_list_at(
-                        "Select session (= match, ! mismatch, ? unknown)",
-                        &items,
-                        initial_index,
+                if let Some(index) = tui.pick_from_list_at(
+                    "Select session (= match, ! mismatch, ? unknown)",
+                    &items,
+                    initial_index,
+                )? {
+                    let Some((next_session, outcome)) = resolve_selected_session(
+                        tui,
+                        config.session_dir,
+                        &sessions[index],
+                        config.provider_spec,
                     )?
-            {
-                let Some((next_session, outcome)) = resolve_selected_session(
-                    tui,
-                    config.session_dir,
-                    &sessions[index],
-                    config.provider_spec,
-                )? else {
-                    tui.set_status("Session switch cancelled");
-                    tui.redraw()?;
-                    return Ok(true);
-                };
-                *session = next_session;
-                reset_agent_and_tui(session, agent, tui, config.provider_spec, None).await?;
-                match outcome {
-                    SessionSelectionOutcome::OpenedMatch => {
-                        tui.push_system_note(format!("opened session {}", session.path().display()));
-                    }
-                    SessionSelectionOutcome::OpenedMismatch => {
-                        tui.push_system_note(format!(
-                            "opened mismatched session {}",
-                            session.path().display()
-                        ));
-                        append_provider_mismatch_note(session, config.provider_spec, tui);
-                    }
-                    SessionSelectionOutcome::ForkedMismatch => {
-                        tui.push_system_note(format!(
-                            "forked mismatched session into {} with provider {}",
-                            session.path().display(),
-                            config.provider_spec.display_name
-                        ));
-                        tui.set_status("Forked from mismatched session");
+                    else {
+                        tui.set_status("Session switch cancelled");
+                        tui.redraw()?;
+                        return Ok(true);
+                    };
+                    *session = next_session;
+                    reset_agent_and_tui(session, agent, tui, config.provider_spec, None).await?;
+                    match outcome {
+                        SessionSelectionOutcome::OpenedMatch => {
+                            tui.push_system_note(format!(
+                                "opened session {}",
+                                session.path().display()
+                            ));
+                        }
+                        SessionSelectionOutcome::OpenedMismatch => {
+                            tui.push_system_note(format!(
+                                "opened mismatched session {}",
+                                session.path().display()
+                            ));
+                            append_provider_mismatch_note(session, config.provider_spec, tui);
+                        }
+                        SessionSelectionOutcome::ForkedMismatch => {
+                            tui.push_system_note(format!(
+                                "forked mismatched session into {} with provider {}",
+                                session.path().display(),
+                                config.provider_spec.display_name
+                            ));
+                            tui.set_status("Forked from mismatched session");
+                        }
                     }
                 }
-            }
             }
             tui.redraw()?;
             Ok(true)
@@ -335,7 +332,11 @@ async fn try_handle_local_command(
             let items = checkpoint_items
                 .iter()
                 .map(|checkpoint| {
-                    let branch_marker = if checkpoint.is_current_leaf { "●" } else { "·" };
+                    let branch_marker = if checkpoint.is_current_leaf {
+                        "●"
+                    } else {
+                        "·"
+                    };
                     let label = format_tree_checkpoint_label(session, checkpoint);
                     format!(
                         "{branch_marker} {} {}",
@@ -348,7 +349,9 @@ async fn try_handle_local_command(
                 .iter()
                 .position(|checkpoint| checkpoint.is_current_leaf)
                 .unwrap_or(0);
-            if let Some(index) = tui.pick_from_list_at("Select checkpoint", &items, initial_index)? {
+            if let Some(index) =
+                tui.pick_from_list_at("Select checkpoint", &items, initial_index)?
+            {
                 session.set_leaf(Some(checkpoint_items[index].entry_id.clone()));
                 reset_agent_and_tui(session, agent, tui, config.provider_spec, None).await?;
                 tui.push_system_note(format!(
@@ -450,8 +453,7 @@ async fn reset_agent_and_tui(
     if let Some(compaction) = compaction {
         tui.set_status(format!(
             "{} · compacted {}",
-            provider_spec.display_name,
-            compaction.compacted_message_count,
+            provider_spec.display_name, compaction.compacted_message_count,
         ));
     } else {
         tui.set_status("Ready");
@@ -484,21 +486,17 @@ fn append_provider_mismatch_note(
 }
 
 fn set_prompt_status(tui: &mut TuiApp, session: &SessionStore, provider_spec: &ProviderSpec) {
-    if let Some(session_provider) = session.header().provider.as_ref() {
-        if !provider_spec.mismatch_lines(session_provider).is_empty() {
-            tui.set_status(PROVIDER_MISMATCH_STATUS);
-            return;
-        }
+    if let Some(session_provider) = session.header().provider.as_ref()
+        && !provider_spec.mismatch_lines(session_provider).is_empty()
+    {
+        tui.set_status(PROVIDER_MISMATCH_STATUS);
+        return;
     }
 
     tui.set_status("Ready");
 }
 
-fn apply_footer_context(
-    tui: &mut TuiApp,
-    session: &SessionStore,
-    provider_spec: &ProviderSpec,
-) {
+fn apply_footer_context(tui: &mut TuiApp, session: &SessionStore, provider_spec: &ProviderSpec) {
     let cwd = Path::new(&session.header().cwd);
     let path_label = format_home_path(cwd);
     tui.set_footer_context(path_label, provider_spec.default_model.clone());
@@ -536,12 +534,7 @@ fn format_tree_checkpoint_label(
     session: &SessionStore,
     checkpoint: &agent_session::SessionCheckpoint,
 ) -> String {
-    let raw = checkpoint
-        .label
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim();
+    let raw = checkpoint.label.lines().next().unwrap_or_default().trim();
 
     if let Some(rest) = raw.strip_prefix("You: ") {
         return format!("Me: {rest}");
@@ -621,10 +614,12 @@ mod tests {
                 text: "world".to_string(),
             })],
         });
-        store.append_run(&agent_core::AgentRunResult {
-            new_messages: vec![user.clone(), assistant.clone()],
-            ..Default::default()
-        }).unwrap();
+        store
+            .append_run(&agent_core::AgentRunResult {
+                new_messages: vec![user.clone(), assistant.clone()],
+                ..Default::default()
+            })
+            .unwrap();
         let checkpoints = store.checkpoints();
         let user_label = format_tree_checkpoint_label(&store, &checkpoints[0]);
         let assistant_label = format_tree_checkpoint_label(&store, &checkpoints[1]);

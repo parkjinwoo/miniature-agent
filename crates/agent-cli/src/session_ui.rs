@@ -36,7 +36,8 @@ pub(crate) fn resolve_selected_session(
     match pick_mismatch_resolution(tui, &prompt, &options)? {
         MismatchResolution::Fork => {
             let store = SessionStore::open(&summary.path)?;
-            let forked = store.fork_with_provider(session_dir, Some(provider_spec.to_session_info()))?;
+            let forked =
+                store.fork_with_provider(session_dir, Some(provider_spec.to_session_info()))?;
             Ok(Some((forked, SessionSelectionOutcome::ForkedMismatch)))
         }
         MismatchResolution::OpenExisting => SessionStore::open(&summary.path)
@@ -72,7 +73,10 @@ pub(crate) fn mismatch_resolution_prompt(
 
 pub(crate) fn mismatch_resolution_options(provider_spec: &ProviderSpec) -> Vec<String> {
     vec![
-        format!("Fork with current provider ({}) [recommended]", provider_spec.display_name),
+        format!(
+            "Fork with current provider ({}) [recommended]",
+            provider_spec.display_name
+        ),
         "Open existing session as-is [advanced]".to_string(),
         "Cancel".to_string(),
     ]
@@ -185,7 +189,10 @@ pub(crate) fn session_provider_label(session: &agent_session::SessionSummary) ->
 }
 
 pub(crate) fn runtime_provider_label(provider_spec: &ProviderSpec) -> String {
-    format!("{}/{}", provider_spec.display_name, provider_spec.default_model)
+    format!(
+        "{}/{}",
+        provider_spec.display_name, provider_spec.default_model
+    )
 }
 
 fn format_short_timestamp(timestamp: &str) -> String {

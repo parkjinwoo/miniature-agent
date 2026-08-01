@@ -107,10 +107,12 @@ impl Provider {
 impl ProviderSpec {
     pub fn resolved_base_url(&self) -> Option<String> {
         self.base_url.clone().or_else(|| {
-            self.base_url_env.as_deref().and_then(|env_name| match std::env::var(env_name) {
-                Ok(base_url) if !base_url.trim().is_empty() => Some(base_url),
-                _ => None,
-            })
+            self.base_url_env
+                .as_deref()
+                .and_then(|env_name| match std::env::var(env_name) {
+                    Ok(base_url) if !base_url.trim().is_empty() => Some(base_url),
+                    _ => None,
+                })
         })
     }
 
@@ -200,13 +202,13 @@ impl ProviderSpec {
         let runtime = self.to_session_info();
         let mut lines = Vec::new();
 
-        compare_field(&mut lines, "provider", &runtime.display_name, &session.display_name);
         compare_field(
             &mut lines,
-            "model",
-            &runtime.model,
-            &session.model,
+            "provider",
+            &runtime.display_name,
+            &session.display_name,
         );
+        compare_field(&mut lines, "model", &runtime.model, &session.model);
         compare_field(&mut lines, "backend", &runtime.backend, &session.backend);
         compare_optional_field(
             &mut lines,
@@ -217,21 +219,26 @@ impl ProviderSpec {
 
         match (&runtime.compat, &session.compat) {
             (Some(runtime_compat), Some(session_compat)) => {
-                if runtime_compat.supports_reasoning_effort != session_compat.supports_reasoning_effort {
+                if runtime_compat.supports_reasoning_effort
+                    != session_compat.supports_reasoning_effort
+                {
                     lines.push(format!(
                         "compat.supports_reasoning_effort: runtime={} session={}",
                         runtime_compat.supports_reasoning_effort,
                         session_compat.supports_reasoning_effort
                     ));
                 }
-                if runtime_compat.supports_developer_role != session_compat.supports_developer_role {
+                if runtime_compat.supports_developer_role != session_compat.supports_developer_role
+                {
                     lines.push(format!(
                         "compat.supports_developer_role: runtime={} session={}",
                         runtime_compat.supports_developer_role,
                         session_compat.supports_developer_role
                     ));
                 }
-                if runtime_compat.requires_tool_result_name != session_compat.requires_tool_result_name {
+                if runtime_compat.requires_tool_result_name
+                    != session_compat.requires_tool_result_name
+                {
                     lines.push(format!(
                         "compat.requires_tool_result_name: runtime={} session={}",
                         runtime_compat.requires_tool_result_name,
@@ -277,24 +284,20 @@ impl ProviderSpec {
             self.display_name = Box::leak(display_name.clone().into_boxed_str());
         }
 
-        if let BackendSpec::ChatCompletions {
-            compat,
-            ..
-        } = &mut self.backend
+        if let BackendSpec::ChatCompletions { compat, .. } = &mut self.backend
+            && let Some(compat_override) = &override_spec.compat
         {
-            if let Some(compat_override) = &override_spec.compat {
-                if let Some(value) = compat_override.supports_reasoning_effort {
-                    compat.supports_reasoning_effort = value;
-                }
-                if let Some(value) = compat_override.supports_developer_role {
-                    compat.supports_developer_role = value;
-                }
-                if let Some(value) = compat_override.requires_tool_result_name {
-                    compat.requires_tool_result_name = value;
-                }
-                if compat_override.reasoning_field.is_some() {
-                    compat.reasoning_field = compat_override.reasoning_field.clone();
-                }
+            if let Some(value) = compat_override.supports_reasoning_effort {
+                compat.supports_reasoning_effort = value;
+            }
+            if let Some(value) = compat_override.supports_developer_role {
+                compat.supports_developer_role = value;
+            }
+            if let Some(value) = compat_override.requires_tool_result_name {
+                compat.requires_tool_result_name = value;
+            }
+            if compat_override.reasoning_field.is_some() {
+                compat.reasoning_field = compat_override.reasoning_field.clone();
             }
         }
     }
@@ -361,7 +364,10 @@ reasoning_field = "reasoning_content"
                 compat,
                 ..
             } => {
-                assert_eq!(default_base_url, "http://localhost:11434/v1/chat/completions");
+                assert_eq!(
+                    default_base_url,
+                    "http://localhost:11434/v1/chat/completions"
+                );
                 assert!(!compat.supports_reasoning_effort);
                 assert!(!compat.supports_developer_role);
                 assert_eq!(compat.reasoning_field.as_deref(), Some("reasoning_content"));
